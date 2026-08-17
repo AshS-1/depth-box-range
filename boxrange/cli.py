@@ -22,11 +22,13 @@ from .segment import PlaneClusterDetector
 
 def build_source(args):
     if args.source == "live":
-        return RealSenseSource(width=args.width, height=args.height, fps=args.fps)
+        return RealSenseSource(
+            width=args.width, height=args.height, fps=args.fps, color=not args.no_color
+        )
     if args.source == "bag":
         if not args.path:
             raise SystemExit("--path is required for --source bag")
-        return RealSenseSource(bag_path=args.path)
+        return RealSenseSource(bag_path=args.path, color=not args.no_color)
     if args.source == "npz":
         if not args.path:
             raise SystemExit("--path is required for --source npz")
@@ -39,6 +41,55 @@ def build_source(args):
     # frames=0 means "keep going" everywhere else, so don't hand the synthetic
     # source a zero-length stream.
     return SyntheticSource(scene, frames=args.frames or 300, noise=not args.no_noise)
+
+
+def probe() -> int:
+    """Report what the RealSense stack can actually see, before streaming.
+
+    Separates the three failures that all look identical from a dead pipeline:
+    the library is missing, no device is plugged in, or the device is there but
+    the stream config was refused (usually USB 2).
+    """
+    try:
+        import pyrealsense2 as rs
+    except ImportError:
+        print("pyrealsense2 not installed. `pip install -e \".[realsense]\"`",
+              file=sys.stderr)
+        return 1
+
+    devices = list(rs.context().query_devices())
+    if not devices:
+        print("no RealSense device found. Check the cable (USB 3, blue port), "
+              "and on Linux that udev rules are installed.", file=sys.stderr)
+        return 1
+
+    for dev in devices:
+        name = dev.get_info(rs.camera_info.name)
+        serial = dev.get_info(rs.camera_info.serial_number)
+        usb = "unknown"
+        if dev.supports(rs.camera_info.usb_type_descriptor):
+            usb = dev.get_info(rs.camera_info.usb_type_descriptor)
+        print(f"{name}  serial {serial}  USB {usb}")
+        if usb.startswith("2"):
+            print("  warning: USB 2 link. Depth resolution and frame rate will "
+                  "be limited; use a USB 3 port and cable.")
+
+    # Actually opening the stream is the only real test of the config.
+    try:
+        source = RealSenseSource(color=False, warmup_frames=2)
+    except Exception as exc:
+        print(f"device found but streaming failed: {exc}", file=sys.stderr)
+        return 1
+
+    intr = source.intrinsics
+    source.close()
+    print(f"depth stream {intr.width}x{intr.height}  "
+          f"fx={intr.fx:.1f} fy={intr.fy:.1f} cx={intr.cx:.1f} cy={intr.cy:.1f}")
+    print(f"depth_scale={intr.depth_scale:.6f} m/unit  baseline={intr.baseline_m:.4f} m")
+    print(f"modelled noise: +/-{intr.range_sigma(1.0) * 1000:.0f} mm at 1 m, "
+          f"+/-{intr.range_sigma(3.0) * 1000:.0f} mm at 3 m")
+    print("\nOK -- camera is streaming. Run: python -m boxrange --source live --no-color --show")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
+    p.add_argument(
+        "--no-color", action="store_true",
+        help="live/bag: depth only. Recommended for ranging -- aligning depth to "
+             "the colour frame crops depth FOV (~87x58 deg down to ~69x42) and "
+             "resamples depth at the discontinuities segmentation relies on",
+    )
     p.add_argument("--frames", type=int, default=30, help="frames to process (0 = all)")
 
     p.add_argument("--distance", type=float, default=1.6, help="synthetic: box distance")
@@ -74,7 +131,15 @@ def main(argv: list[str] | None = None) -> int:
         help="measure known-truth scenes and print a pass/fail table (no camera needed)",
     )
 
+    p.add_argument(
+        "--probe", action="store_true",
+        help="report connected RealSense devices and stream settings, then exit",
+    )
+
     args = p.parse_args(argv)
+
+    if args.probe:
+        return probe()
 
     if args.selftest:
         from .selftest import run
