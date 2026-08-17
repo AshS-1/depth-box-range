@@ -1,0 +1,21 @@
+# Virtualenvs -- never commit these, they are ~200 MB of platform-specific
+# binaries and will not work on the lab machine anyway.
+.venv/
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Captures and outputs
+*.bag
+*.npz
+*.png
+*.jpg
+!docs/*.png

@@ -159,7 +159,9 @@ class OrientedBox:
         return float(np.arctan2(self.R[1, 0], self.R[0, 0]))
 
 
-def fit_box_on_plane(points: np.ndarray, plane: Plane) -> OrientedBox | None:
+def fit_box_on_plane(
+    points: np.ndarray, plane: Plane, *, trim_percent: float = 2.0
+) -> OrientedBox | None:
     """Fit an oriented box to ``points``, constrained to stand on ``plane``.
 
     A free 3D PCA fit is the obvious approach and it is the wrong one here: a
@@ -188,12 +190,25 @@ def fit_box_on_plane(points: np.ndarray, plane: Plane) -> OrientedBox | None:
     # convention has changed between releases, the corner order has not.
     edge_a = quad[1] - quad[0]
     edge_b = quad[2] - quad[1]
-    len_a = float(np.linalg.norm(edge_a))
-    len_b = float(np.linalg.norm(edge_b))
+    if np.linalg.norm(edge_a) < 1e-6 or np.linalg.norm(edge_b) < 1e-6:
+        return None
+    axis_a_2d = edge_a / np.linalg.norm(edge_a)
+    axis_b_2d = edge_b / np.linalg.norm(edge_b)
+
+    # Take only the *directions* from minAreaRect and re-measure the lengths by
+    # percentile. minAreaRect is a hull operation, so every noisy outlier pushes
+    # the rectangle outward and never inward -- the error is one-sided, and it
+    # grows with the z^2 depth noise. At 3.5 m that inflated a 0.40 m box to
+    # 0.62 m. Trimming the tails costs a hair of true extent and removes the bias.
+    proj_a = uv.astype(np.float64) @ axis_a_2d
+    proj_b = uv.astype(np.float64) @ axis_b_2d
+    lo_a, hi_a = np.percentile(proj_a, [trim_percent, 100.0 - trim_percent])
+    lo_b, hi_b = np.percentile(proj_b, [trim_percent, 100.0 - trim_percent])
+
+    len_a = float(hi_a - lo_a)
+    len_b = float(hi_b - lo_b)
     if len_a < 1e-6 or len_b < 1e-6:
         return None
-    axis_a_2d = edge_a / len_a
-    axis_b_2d = edge_b / len_b
 
     a1 = axis_a_2d[0] * e1 + axis_a_2d[1] * e2
     a2 = axis_b_2d[0] * e1 + axis_b_2d[1] * e2
@@ -201,10 +216,11 @@ def fit_box_on_plane(points: np.ndarray, plane: Plane) -> OrientedBox | None:
 
     # The box sits on the plane, so it spans from the ground up to its top face.
     # Use a high percentile rather than the max to shrug off flyer pixels.
-    top = float(np.percentile(height, 99.0))
+    top = float(np.percentile(height, 100.0 - trim_percent))
     top = max(top, 1e-3)
 
-    center_2d = quad.mean(axis=0)
+    # Centre is the midpoint of the trimmed spans, consistent with the extents.
+    center_2d = ((lo_a + hi_a) / 2.0) * axis_a_2d + ((lo_b + hi_b) / 2.0) * axis_b_2d
     center = (
         origin
         + center_2d[0] * e1
@@ -220,14 +236,37 @@ def fit_box_on_plane(points: np.ndarray, plane: Plane) -> OrientedBox | None:
     return OrientedBox(center, R, np.array([len_a, len_b, top], dtype=np.float64))
 
 
+def face_tolerance(box: OrientedBox, sigma_m: float, *, floor_m: float = 0.02) -> float:
+    """How close a point must be to a face plane to count as lying on it.
+
+    Scales with the sensor noise at this range, but is capped at a fraction of
+    the box's own smallest half-extent -- without that cap, a far-away small box
+    gets a tolerance wide enough that a single point counts as being on two
+    opposite faces at once, and the count becomes meaningless in the other
+    direction.
+    """
+    cap = 0.25 * float(np.min(box.extents)) / 2.0
+    return float(np.clip(1.5 * sigma_m, floor_m, max(cap, floor_m)))
+
+
 def count_visible_faces(
-    points: np.ndarray, box: OrientedBox, *, tol: float = 0.02, min_frac: float = 0.08
+    points: np.ndarray,
+    box: OrientedBox,
+    *,
+    tol: float = 0.02,
+    min_frac: float = 0.08,
+    exclude_bottom: bool = True,
 ) -> int:
     """How many of the box's faces carry a meaningful share of the points.
 
     Drives the confidence score: with only one face visible the box's depth
     along the viewing direction is unobservable, so the centre estimate is a
     guess and the caller deserves to know.
+
+    ``tol`` must track the sensor's noise at the box's range or this silently
+    becomes a distance meter instead of a geometry check -- at 3.5 m the depth
+    scatter alone is ~5 cm, so a fixed 2 cm band reports faces vanishing when
+    nothing about the view changed. See :func:`face_tolerance`.
     """
     if len(points) == 0:
         return 0
@@ -237,7 +276,14 @@ def count_visible_faces(
     seen = 0
     for axis in range(3):
         for sign in (-1.0, 1.0):
+            # Axis 2 is the plane normal by construction, so (2, -1) is the face
+            # resting on the ground. It is never observable, but points along
+            # the bottom edge of a *side* face sit within tol of it, which used
+            # to push the count to 4 -- impossible for a convex box, which shows
+            # at most 3 faces from any one viewpoint.
+            if exclude_bottom and axis == 2 and sign < 0:
+                continue
             on_face = np.abs(local[:, axis] - sign * half[axis]) < tol
             if on_face.mean() >= min_frac:
                 seen += 1
-    return seen
+    return min(seen, 3)
