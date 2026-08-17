@@ -30,7 +30,9 @@ def build_source(args):
         yaw=np.deg2rad(args.yaw),
         box_size=tuple(args.box_size),
     )
-    return SyntheticSource(scene, frames=args.frames, noise=not args.no_noise)
+    # frames=0 means "keep going" everywhere else, so don't hand the synthetic
+    # source a zero-length stream.
+    return SyntheticSource(scene, frames=args.frames or 300, noise=not args.no_noise)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -61,8 +63,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--save-overlay", help="write the first overlay frame to this path")
     p.add_argument("--record", help="save frames to this .npz and exit")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument(
+        "--selftest", action="store_true",
+        help="measure known-truth scenes and print a pass/fail table (no camera needed)",
+    )
 
     args = p.parse_args(argv)
+
+    if args.selftest:
+        from .selftest import run
+
+        return 0 if run() else 1
+
     source = build_source(args)
 
     if args.record:

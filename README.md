@@ -7,6 +7,30 @@ training, no CAD model, no GPU.
 
 ![overlay](docs/overlay.png)
 
+## Does it work?
+
+One command, no camera and no install needed — it puts a box at known
+distances, measures it, and checks the answer against truth:
+
+```bash
+python -m boxrange --selftest
+```
+
+```
+   truth   reported     error      +/-  size err  faces   conf   verdict
+--------------------------------------------------------------------------
+  0.998m     0.991m   -0.007m   0.005m    0.023m    3.0   0.80   ok
+  1.873m     1.846m   -0.027m   0.018m    0.011m    3.0   0.80   ok
+  2.831m     2.773m   -0.058m   0.035m    0.023m    3.0   0.80   ok
+  3.812m     3.704m   -0.107m   0.050m    0.078m    2.3   0.52   ok
+--------------------------------------------------------------------------
+34.9 ms/frame (29 FPS) on this CPU
+
+PASS -- ranging tracks ground truth.
+```
+
+Exit code is 0 on pass, 1 on failure, so it drops straight into CI.
+
 ## Quick start
 
 Runs with no camera attached — the synthetic source renders a box with a
