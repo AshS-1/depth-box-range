@@ -17,7 +17,6 @@ from boxrange import (
     SyntheticSource,
     closest_point_on_box,
     deproject,
-    estimate_range,
     fit_box_on_plane,
     fit_plane_ransac,
     render_depth,

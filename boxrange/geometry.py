@@ -26,7 +26,12 @@ def deproject(depth_m: np.ndarray, intr: CameraIntrinsics) -> np.ndarray:
     uu, vv = np.meshgrid(u, v)
 
     z = depth_m.astype(np.float32, copy=True)
-    z[z <= 0] = np.nan
+    # Non-finite input must be neutralised *before* the multiply, not after: at
+    # the principal point (uu - cx) is exactly 0, and 0 * inf is NaN plus a
+    # spurious "invalid value" warning. Folding inf into the invalid marker
+    # keeps the arithmetic clean.
+    with np.errstate(invalid="ignore"):
+        z[~np.isfinite(z) | (z <= 0)] = np.nan
 
     x = (uu - intr.cx) * z / intr.fx
     y = (vv - intr.cy) * z / intr.fy
@@ -175,6 +180,8 @@ def fit_box_on_plane(
     """
     if len(points) < 10:
         return None
+    if not 0.0 <= trim_percent < 50.0:
+        raise ValueError(f"trim_percent must be in [0, 50), got {trim_percent}")
 
     e1, e2 = plane.basis()
     origin = plane.point

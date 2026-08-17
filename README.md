@@ -209,6 +209,25 @@ semantics geometry can't supply.
 - Coordinate convention throughout is the depth optical frame: +x right,
   +y down, +z forward (OpenCV / RealSense).
 
+- `python -m boxrange` works from the repo root. After `pip install -e .` the
+  `boxrange` command works from anywhere.
+
+## Tests
+
 ```bash
-pytest -q    # 23 tests, ~3 s
+pytest -q
+ruff check boxrange/ tests/
 ```
+
+48 tests in ~4 s, split in two:
+
+- **`test_accuracy.py`** — asserts *metric* results against scenes whose truth
+  is known exactly. A pipeline that runs cleanly but reports 1.8 m for a box at
+  1.6 m is worse than one that crashes.
+- **`test_robustness.py`** — one regression test per bug actually hit while
+  fuzzing: degenerate depth (all-zero / NaN / inf / negative / 1e9 / 1×1
+  images), int32 overflow in the overlay projection, NaN leaking into JSON,
+  region-mask shape mismatch, and `.npz` round-tripping.
+
+Warnings are errors (`filterwarnings = ["error::RuntimeWarning"]`), so a silent
+numpy invalid-value warning fails the build rather than scrolling past.

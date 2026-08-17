@@ -160,24 +160,39 @@ class BoxRangePipeline:
         self._tracks = [t for t in self._tracks if t.misses <= self.max_misses]
 
 
+def _num(value: float, digits: int = 4) -> float | None:
+    """Round for output, mapping non-finite to None.
+
+    ``json.dumps`` happily emits a bare ``NaN`` token, which is not valid JSON
+    and blows up strict parsers downstream. An untracked detection carries a
+    NaN ``smoothed_surface_m``, so this is reachable, not theoretical.
+    """
+    v = float(value)
+    return round(v, digits) if np.isfinite(v) else None
+
+
 def detection_to_dict(det: BoxDetection, frame: Frame) -> dict:
-    """Flat JSON-safe record, for logging or piping into another process."""
+    """Flat JSON-safe record, for logging or piping into another process.
+
+    Guaranteed to contain no NaN or Infinity, so ``json.dumps`` output parses
+    under any strict JSON reader.
+    """
     r = det.range
     return {
         "frame": frame.index,
         "timestamp_s": round(frame.timestamp_s, 4),
         "track_id": det.track_id,
-        "distance_m": round(r.surface_m, 4),
-        "distance_smoothed_m": round(det.smoothed_surface_m, 4),
-        "axial_m": round(r.axial_m, 4),
-        "centroid_m": round(r.centroid_m, 4),
-        "measured_m": round(r.measured_m, 4),
-        "sigma_m": round(r.sigma_m, 4),
-        "confidence": round(r.confidence, 3),
-        "visible_faces": r.visible_faces,
-        "fit_rms_m": round(r.fit_rms_m, 4),
-        "n_points": r.n_points,
-        "extents_m": [round(float(e), 4) for e in det.box.extents],
-        "center_xyz_m": [round(float(v), 4) for v in det.box.center],
-        "yaw_deg": round(float(np.rad2deg(det.box.yaw)), 2),
+        "distance_m": _num(r.surface_m),
+        "distance_smoothed_m": _num(det.smoothed_surface_m),
+        "axial_m": _num(r.axial_m),
+        "centroid_m": _num(r.centroid_m),
+        "measured_m": _num(r.measured_m),
+        "sigma_m": _num(r.sigma_m),
+        "confidence": _num(r.confidence, 3),
+        "visible_faces": int(r.visible_faces),
+        "fit_rms_m": _num(r.fit_rms_m),
+        "n_points": int(r.n_points),
+        "extents_m": [_num(e) for e in det.box.extents],
+        "center_xyz_m": [_num(v) for v in det.box.center],
+        "yaw_deg": _num(np.rad2deg(det.box.yaw), 2),
     }

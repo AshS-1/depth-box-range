@@ -36,12 +36,12 @@ class CameraIntrinsics:
         )
 
     @classmethod
-    def from_matrix(cls, K, width: int, height: int, **kw) -> "CameraIntrinsics":
+    def from_matrix(cls, K, width: int, height: int, **kw) -> CameraIntrinsics:
         K = np.asarray(K, dtype=np.float64).reshape(3, 3)
         return cls(width, height, K[0, 0], K[1, 1], K[0, 2], K[1, 2], **kw)
 
     @classmethod
-    def from_realsense(cls, intr, depth_scale: float = 1e-3) -> "CameraIntrinsics":
+    def from_realsense(cls, intr, depth_scale: float = 1e-3) -> CameraIntrinsics:
         """Build from a ``pyrealsense2.intrinsics`` object."""
         return cls(
             width=intr.width,
@@ -53,12 +53,12 @@ class CameraIntrinsics:
             depth_scale=depth_scale,
         )
 
-    def scaled(self, factor: float) -> "CameraIntrinsics":
+    def scaled(self, factor: float) -> CameraIntrinsics:
         """Intrinsics for an image resized by ``factor`` (0.5 = half size)."""
         return replace(
             self,
-            width=int(round(self.width * factor)),
-            height=int(round(self.height * factor)),
+            width=round(self.width * factor),
+            height=round(self.height * factor),
             fx=self.fx * factor,
             fy=self.fy * factor,
             # Pixel centres shift by half a pixel under the usual resize convention.

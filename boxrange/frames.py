@@ -11,9 +11,11 @@ accuracy tests assert against.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import contextlib
+from collections.abc import Iterator
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Protocol
 
 import numpy as np
 
@@ -99,25 +101,32 @@ class RealSenseSource:
             # batch analysis silently skips most of the recording.
             profile.get_device().as_playback().set_real_time(False)
 
-        self._align = rs.align(rs.stream.color) if color else None
-        self._want_color = color
+        # A recording may simply not contain colour, and asking for its stream
+        # profile then throws. Detect what is actually present rather than
+        # trusting the request.
+        has_color = color and any(
+            s.stream_type() == rs.stream.color for s in profile.get_streams()
+        )
+        if color and not has_color:
+            color = False
+
+        self._align = rs.align(rs.stream.color) if has_color else None
+        self._want_color = has_color
 
         depth_sensor = profile.get_device().first_depth_sensor()
         depth_scale = float(depth_sensor.get_depth_scale())
 
         # After alignment the depth image lives in the colour frame, so it is
         # the colour intrinsics that deproject it correctly.
-        stream = rs.stream.color if color else rs.stream.depth
+        stream = rs.stream.color if has_color else rs.stream.depth
         vsp = profile.get_stream(stream).as_video_stream_profile()
         self.intrinsics = CameraIntrinsics.from_realsense(
             vsp.get_intrinsics(), depth_scale=depth_scale
         )
 
         baseline = self._read_baseline(profile)
-        if baseline is not None:
-            self.intrinsics = CameraIntrinsics(
-                **{**self.intrinsics.__dict__, "baseline_m": baseline}
-            )
+        if baseline is not None and baseline > 0:
+            self.intrinsics = replace(self.intrinsics, baseline_m=baseline)
 
         for _ in range(warmup_frames):
             # Auto-exposure needs a few frames to settle; depth from the first
@@ -137,11 +146,10 @@ class RealSenseSource:
             right = profile.get_stream(rs.stream.infrared, 2)
             t = left.get_extrinsics_to(right).translation
             return float(np.linalg.norm(np.asarray(t, dtype=np.float64)))
-        except Exception:
+        except RuntimeError:
             return None  # Not all configs expose IR; the default is close enough.
 
     def __iter__(self) -> Iterator[Frame]:
-        rs = self._rs
         while not self._closed:
             try:
                 frames = self._pipeline.wait_for_frames(timeout_ms=5000)
@@ -176,12 +184,12 @@ class RealSenseSource:
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            try:
+            # Already stopped, or the device was unplugged mid-stream. Teardown
+            # must not raise, or the `with` block masks the real error.
+            with contextlib.suppress(RuntimeError):
                 self._pipeline.stop()
-            except Exception:
-                pass
 
-    def __enter__(self) -> "RealSenseSource":
+    def __enter__(self) -> RealSenseSource:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -201,7 +209,9 @@ class NpzSource:
 
     def __init__(self, path: str | Path) -> None:
         data = np.load(Path(path), allow_pickle=False)
-        self._depth = data["depth_m"]
+        depth = data["depth_m"]
+        # Tolerate a single frame saved as (H, W) rather than (1, H, W).
+        self._depth = depth[None] if depth.ndim == 2 else depth
         self._color = data["color"] if "color" in data.files else None
         self.intrinsics = CameraIntrinsics(
             width=int(data["width"]),
@@ -227,7 +237,7 @@ class NpzSource:
     def close(self) -> None:
         pass
 
-    def __enter__(self) -> "NpzSource":
+    def __enter__(self) -> NpzSource:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -240,13 +250,18 @@ def record_npz(source: FrameSource, path: str | Path, max_frames: int = 150) -> 
     for frame in source:
         intr = frame.intrinsics
         depths.append(frame.depth_m.astype(np.float32))
-        if frame.color is not None:
-            colors.append(frame.color)
+        colors.append(frame.color)
         if len(depths) >= max_frames:
             break
 
     if intr is None:
         raise RuntimeError("source produced no frames")
+
+    # Colour is saved only if *every* frame had it. Appending only the frames
+    # that did would silently shift colour out of step with depth, so replay
+    # would pair each depth frame with some other frame's image.
+    if any(c is None for c in colors):
+        colors = []
 
     payload = {
         "depth_m": np.asarray(depths, dtype=np.float32),
@@ -425,7 +440,7 @@ class SyntheticSource:
     def close(self) -> None:
         pass
 
-    def __enter__(self) -> "SyntheticSource":
+    def __enter__(self) -> SyntheticSource:
         return self
 
     def __exit__(self, *exc) -> None:

@@ -132,7 +132,7 @@ class PlaneClusterDetector:
         ) + self.jump_floor_m
         keep = above & ~depth_discontinuities(depth_m, tol.astype(np.float32))
 
-        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        _, labels, stats, _ = cv2.connectedComponentsWithStats(
             keep.astype(np.uint8), connectivity=8
         )
 
@@ -181,21 +181,35 @@ class RegionPriorDetector:
         intrinsics: CameraIntrinsics,
         regions: list[np.ndarray],
     ) -> tuple[list[Candidate], Plane | None]:
+        for i, region in enumerate(regions):
+            # Fail loudly and early. Broadcasting a mismatched mask deeper in
+            # raises an opaque shape error that gives no clue which region and
+            # no clue that a resize was needed.
+            if np.shape(region) != depth_m.shape:
+                raise ValueError(
+                    f"region {i} has shape {np.shape(region)}, expected "
+                    f"{depth_m.shape}; resize the detector's mask to the depth "
+                    "frame before passing it in"
+                )
+
         cands, plane = self.inner.detect(depth_m, intrinsics)
         if plane is None or not regions:
             return cands, plane
 
+        # Deproject once. This used to sit inside the region loop, re-running a
+        # full-frame deprojection for every region.
+        cloud = deproject(depth_m, intrinsics)
+
         out: list[Candidate] = []
         for i, region in enumerate(regions):
+            region = np.asarray(region, dtype=bool)
             merged = np.zeros_like(region, dtype=bool)
             for c in cands:
                 # Keep a cluster if most of it falls inside the region.
-                overlap = (c.mask & region).sum()
-                if overlap > 0.5 * c.mask.sum():
+                if (c.mask & region).sum() > 0.5 * c.mask.sum():
                     merged |= c.mask
             if not merged.any():
                 continue
-            cloud = deproject(depth_m, intrinsics)
             pts = cloud[merged]
             pts = pts[np.isfinite(pts).all(axis=1)]
             if len(pts) >= self.inner.min_points:

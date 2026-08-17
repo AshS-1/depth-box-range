@@ -27,3 +27,14 @@ packages = ["boxrange"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# PYI034 wants `typing.Self` as the __enter__ return type, which is 3.11+ only
+# while this package supports 3.10. The quoted-class annotation it replaces is
+# correct; adopting Self would mean a typing_extensions dependency for one hint.
+ignore = ["PYI034"]

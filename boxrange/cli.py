@@ -9,7 +9,13 @@ import time
 
 import numpy as np
 
-from .frames import NpzSource, RealSenseSource, SyntheticScene, SyntheticSource, record_npz
+from .frames import (
+    NpzSource,
+    RealSenseSource,
+    SyntheticScene,
+    SyntheticSource,
+    record_npz,
+)
 from .pipeline import BoxRangePipeline, detection_to_dict
 from .segment import PlaneClusterDetector
 
@@ -76,6 +82,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if run() else 1
 
     source = build_source(args)
+
+    # On synthetic input we know the answer, so print it. --distance places the
+    # box *centre* at that range along the floor, while the pipeline reports the
+    # distance to the nearest *face* -- without this the two look like a 15 cm
+    # error when they are measuring different things.
+    if args.source == "synthetic" and not args.json and not args.quiet:
+        from .ranging import closest_point_on_box
+
+        truth = float(np.linalg.norm(closest_point_on_box(source.truth_box())))
+        print(
+            f"ground truth: nearest face at {truth:.3f} m "
+            f"(--distance {args.distance} sets the box centre on the floor)",
+            file=sys.stderr,
+        )
 
     if args.record:
         n = record_npz(source, args.record, max_frames=args.frames or 150)

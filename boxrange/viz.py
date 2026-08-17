@@ -16,6 +16,23 @@ _EDGES = (
 )
 
 
+def _to_pixel(uv: np.ndarray, shape: tuple[int, ...]) -> tuple[int, int] | None:
+    """Round a projected point to an int pair OpenCV will accept.
+
+    A corner near the image plane (tiny positive z) projects to coordinates in
+    the 1e13 range. Those are finite, so a plain isfinite() check passes them
+    straight into cv2.line, which then raises on int32 overflow -- a real crash
+    in --show whenever a box drifts near the frame edge. Clamping to a bound
+    well outside the image keeps the on-screen part of the line identical while
+    staying inside int32.
+    """
+    if not np.isfinite(uv).all():
+        return None
+    bound = 10 * max(shape[0], shape[1])
+    x, y = np.clip(uv, -bound, bound)
+    return round(float(x)), round(float(y))
+
+
 def project(points: np.ndarray, intr: CameraIntrinsics) -> np.ndarray:
     """(N, 3) camera-frame points -> (N, 2) pixels. Points behind go to NaN."""
     pts = np.asarray(points, dtype=np.float64)
@@ -59,18 +76,17 @@ def draw_detection(
 
     uv = project(det.box.corners(), intr)
     for a, b in _EDGES:
-        pa, pb = uv[a], uv[b]
-        if not (np.isfinite(pa).all() and np.isfinite(pb).all()):
+        pa, pb = _to_pixel(uv[a], out.shape), _to_pixel(uv[b], out.shape)
+        if pa is None or pb is None:
             continue
-        cv2.line(out, tuple(np.round(pa).astype(int)), tuple(np.round(pb).astype(int)),
-                 color, 2, cv2.LINE_AA)
+        cv2.line(out, pa, pb, color, 2, cv2.LINE_AA)
 
     # Mark the point the headline distance actually refers to.
     from .ranging import closest_point_on_box
 
-    near = project(closest_point_on_box(det.box)[None, :], intr)[0]
-    if np.isfinite(near).all():
-        cv2.circle(out, tuple(np.round(near).astype(int)), 6, (0, 0, 255), -1, cv2.LINE_AA)
+    near = _to_pixel(project(closest_point_on_box(det.box)[None, :], intr)[0], out.shape)
+    if near is not None:
+        cv2.circle(out, near, 6, (0, 0, 255), -1, cv2.LINE_AA)
 
     finite = uv[np.isfinite(uv).all(axis=1)]
     anchor = (

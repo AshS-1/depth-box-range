@@ -58,6 +58,7 @@ __all__ = [
     "RegionPriorDetector",
     "SyntheticScene",
     "SyntheticSource",
+    "__version__",
     "closest_point_on_box",
     "count_visible_faces",
     "deproject",
@@ -67,5 +68,4 @@ __all__ = [
     "fit_plane_ransac",
     "record_npz",
     "render_depth",
-    "__version__",
 ]
