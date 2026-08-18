@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "boxrange"
 version = "0.1.0"
-description = "Measure the distance to a box from RealSense depth camera input."
+description = "Measure the distance to a box from depth camera input."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,6 +17,13 @@ dependencies = [
 # pyrealsense2 has no wheel for macOS arm64; keep it optional so the package
 # installs and the synthetic path runs anywhere.
 realsense = ["pyrealsense2>=2.54"]
+# The AgiBot X2's chest camera. Wheels exist for Linux and Windows; macOS needs
+# a source build, so this stays optional for the same reason pyrealsense2 does.
+orbbec = ["pyorbbecsdk>=2.0"]
+# Only the mesh builder. FoundationPose itself, torch, nvdiffrast and CUDA are
+# not pip-installable as a set and are not declared here -- follow the upstream
+# install and put its repo root on PYTHONPATH.
+foundationpose = ["trimesh>=4.0"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]

@@ -11,19 +11,28 @@ import numpy as np
 
 from .frames import (
     NpzSource,
+    OrbbecSource,
     RealSenseSource,
     SyntheticScene,
     SyntheticSource,
     record_npz,
 )
+from .intrinsics import CAMERA_PRESETS, PRESET_RESOLUTIONS
 from .pipeline import BoxRangePipeline, detection_to_dict
 from .segment import PlaneClusterDetector
 
 
 def build_source(args):
+    if args.source == "orbbec":
+        # 0 means "whatever the device offers by default" to the Orbbec SDK.
+        return OrbbecSource(
+            width=args.width or 0, height=args.height or 0, fps=args.fps,
+            color=not args.no_color,
+        )
     if args.source == "live":
         return RealSenseSource(
-            width=args.width, height=args.height, fps=args.fps, color=not args.no_color
+            width=args.width or 640, height=args.height or 480, fps=args.fps,
+            color=not args.no_color,
         )
     if args.source == "bag":
         if not args.path:
@@ -38,12 +47,126 @@ def build_source(args):
         yaw=np.deg2rad(args.yaw),
         box_size=tuple(args.box_size),
     )
+    # Simulating a specific camera matters: the X2's Gemini 335 has a 90 deg FOV
+    # and roughly 3x the range noise of a D435 at the same distance, so a result
+    # measured under D435 intrinsics does not transfer to the robot.
+    default_w, default_h = PRESET_RESOLUTIONS[args.camera]
+    intrinsics = CAMERA_PRESETS[args.camera](
+        args.width or default_w, args.height or default_h
+    )
     # frames=0 means "keep going" everywhere else, so don't hand the synthetic
     # source a zero-length stream.
-    return SyntheticSource(scene, frames=args.frames or 300, noise=not args.no_noise)
+    return SyntheticSource(
+        scene, intrinsics, frames=args.frames or 300, noise=not args.no_noise
+    )
 
 
-def probe() -> int:
+def _report_stream(intr, hint: str) -> int:
+    """Print what a source actually negotiated. Shared by both probes."""
+    print(f"depth stream {intr.width}x{intr.height}  "
+          f"fx={intr.fx:.1f} fy={intr.fy:.1f} cx={intr.cx:.1f} cy={intr.cy:.1f}")
+    print(f"depth_scale={intr.depth_scale:.6f} m/unit  baseline={intr.baseline_m:.4f} m")
+    print(f"horizontal FOV {np.rad2deg(2 * np.arctan(intr.width / 2 / intr.fx)):.0f} deg")
+    print(f"modelled noise: +/-{intr.range_sigma(1.0) * 1000:.0f} mm at 1 m, "
+          f"+/-{intr.range_sigma(3.0) * 1000:.0f} mm at 3 m")
+    print(f"\nOK -- camera is streaming. Run: {hint}")
+    return 0
+
+
+class _FoundationPoseEngine:
+    """Adapts :class:`DepthOnlyFoundationPose` to the pipeline's process() shape.
+
+    One pose per frame becomes a zero- or one-element detection list, so the
+    JSON writer, the overlay and the timing code below are shared verbatim
+    between the two engines and their outputs stay comparable.
+    """
+
+    def __init__(self, estimator) -> None:
+        self._estimator = estimator
+
+    def process(self, frame):
+        result = self._estimator.process(frame)
+        return [] if result is None else [result.to_detection()]
+
+
+def build_engine(args):
+    if args.engine == "geometric":
+        return BoxRangePipeline(
+            detector=PlaneClusterDetector(),
+            max_boxes=args.max_boxes,
+            min_confidence=args.min_confidence,
+        )
+
+    from .foundationpose import (
+        DepthOnlyFoundationPose,
+        GeometricEstimator,
+        require_foundationpose,
+    )
+
+    stub = args.engine == "foundationpose-stub"
+    if not stub:
+        # Fail now rather than on the first frame. The estimator is built lazily
+        # because it needs the box extents, which may only be known once a frame
+        # has arrived -- but on a robot that means opening the camera, streaming,
+        # and only then reporting that the environment was never going to work.
+        require_foundationpose()
+
+    if stub:
+        print(
+            "WARNING: --engine foundationpose-stub does not run FoundationPose. "
+            "It swaps in a geometric solver to exercise the mask, mesh, "
+            "pseudo-colour and pose-to-range plumbing without a GPU. Do not "
+            "report its numbers as FoundationPose results.",
+            file=sys.stderr,
+        )
+    return _FoundationPoseEngine(
+        DepthOnlyFoundationPose(
+            extents_m=args.box_extents,
+            estimator=GeometricEstimator() if stub else None,
+        )
+    )
+
+
+def probe_orbbec() -> int:
+    """Report connected Orbbec devices, then actually open the depth stream.
+
+    The X2's chest camera is a Gemini 335, so this is the probe that matters on
+    the robot. Opening the stream is the only real test: enumeration succeeding
+    tells you the USB link is up, not that the mode you asked for exists or that
+    another process has not already claimed the device.
+    """
+    try:
+        import pyorbbecsdk as ob
+    except ImportError:
+        print("pyorbbecsdk not installed. `pip install -e \".[orbbec]\"` "
+              "(Linux/Windows wheels; macOS needs a source build).", file=sys.stderr)
+        return 1
+
+    devices = ob.Context().query_devices()
+    if devices.get_count() == 0:
+        print("no Orbbec device found. Check the USB 3 Type-C cable, and on Linux "
+              "that the SDK's udev rules are installed "
+              "(99-obsensor-libusb.rules, then udevadm control --reload).",
+              file=sys.stderr)
+        return 1
+
+    for i in range(devices.get_count()):
+        info = devices.get_device_by_index(i).get_device_info()
+        print(f"{info.get_name()}  serial {info.get_serial_number()}  "
+              f"firmware {info.get_firmware_version()}")
+
+    try:
+        source = OrbbecSource(color=False, warmup_frames=2)
+    except Exception as exc:
+        print(f"device found but streaming failed: {exc}", file=sys.stderr)
+        return 1
+
+    intr = source.intrinsics
+    source.close()
+    return _report_stream(intr, "python -m boxrange --source orbbec --no-color --show")
+
+
+def probe_realsense() -> int:
     """Report what the RealSense stack can actually see, before streaming.
 
     Separates the three failures that all look identical from a dead pipeline:
@@ -83,27 +206,54 @@ def probe() -> int:
 
     intr = source.intrinsics
     source.close()
-    print(f"depth stream {intr.width}x{intr.height}  "
-          f"fx={intr.fx:.1f} fy={intr.fy:.1f} cx={intr.cx:.1f} cy={intr.cy:.1f}")
-    print(f"depth_scale={intr.depth_scale:.6f} m/unit  baseline={intr.baseline_m:.4f} m")
-    print(f"modelled noise: +/-{intr.range_sigma(1.0) * 1000:.0f} mm at 1 m, "
-          f"+/-{intr.range_sigma(3.0) * 1000:.0f} mm at 3 m")
-    print("\nOK -- camera is streaming. Run: python -m boxrange --source live --no-color --show")
-    return 0
+    return _report_stream(intr, "python -m boxrange --source live --no-color --show")
+
+
+def probe(source: str) -> int:
+    """Probe whichever camera ``--source`` names.
+
+    With no camera named there is no way to know which SDK the user cares about,
+    so try both and report each. Returning 0 if *either* works keeps the exit
+    code meaning "a usable depth camera is attached".
+    """
+    if source == "orbbec":
+        return probe_orbbec()
+    if source in ("live", "bag"):
+        return probe_realsense()
+
+    # Flush: these headers go to stdout while the failure messages below go
+    # to stderr, and without flushing the two arrive out of order.
+    print("== Orbbec (AgiBot X2 chest camera) ==", flush=True)
+    orbbec = probe_orbbec()
+    print("\n== RealSense ==", flush=True)
+    realsense = probe_realsense()
+    return 0 if (orbbec == 0 or realsense == 0) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="boxrange",
-        description="Measure the distance to a box from RealSense depth input.",
+        description="Measure the distance to a box from depth-camera input.",
     )
     p.add_argument(
-        "--source", default="synthetic", choices=("live", "bag", "npz", "synthetic"),
-        help="where frames come from (default: synthetic, needs no hardware)",
+        "--source", default="synthetic",
+        choices=("orbbec", "live", "bag", "npz", "synthetic"),
+        help="where frames come from (default: synthetic, needs no hardware). "
+             "orbbec = Orbbec Gemini 330-series, the AgiBot X2's chest camera; "
+             "live/bag = RealSense",
+    )
+    p.add_argument(
+        "--camera", default="d435", choices=tuple(CAMERA_PRESETS),
+        help="synthetic/selftest: which sensor to model. gemini335 is the X2's "
+             "chest camera and carries ~3x a D435's range noise, so its accuracy "
+             "table is a different table (default: d435)",
     )
     p.add_argument("--path", help="file for --source bag / npz")
-    p.add_argument("--width", type=int, default=640)
-    p.add_argument("--height", type=int, default=480)
+    # Default None, not a number: the right resolution depends on which camera
+    # is in play, and a hardcoded 640x480 would silently model the X2's 8:5
+    # sensor at 4:3 -- a 74 degree vertical FOV it does not have.
+    p.add_argument("--width", type=int, help="depth width (default: per --camera / device)")
+    p.add_argument("--height", type=int, help="depth height (default: per --camera / device)")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument(
         "--no-color", action="store_true",
@@ -124,6 +274,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="one JSON record per detection")
     p.add_argument("--show", action="store_true", help="live overlay window")
     p.add_argument("--save-overlay", help="write the first overlay frame to this path")
+    p.add_argument(
+        "--save-pseudo-rgb",
+        help="write the shading image that stands in for the colour stream to "
+             "this path, then carry on. Worth looking at before trusting any "
+             "FoundationPose result: if it is flat grey, the network is getting "
+             "no appearance signal and only the depth half of its input is real",
+    )
     p.add_argument("--record", help="save frames to this .npz and exit")
     p.add_argument("--quiet", action="store_true")
     p.add_argument(
@@ -133,20 +290,45 @@ def main(argv: list[str] | None = None) -> int:
 
     p.add_argument(
         "--probe", action="store_true",
-        help="report connected RealSense devices and stream settings, then exit",
+        help="report connected cameras and stream settings, then exit. Probes "
+             "the SDK matching --source, or both if none is named",
+    )
+
+    p.add_argument(
+        "--engine", default="geometric",
+        choices=("geometric", "foundationpose", "foundationpose-stub"),
+        help="geometric = the plane-constrained depth fit (default; no GPU). "
+             "foundationpose = 6D pose from NVlabs FoundationPose driven by "
+             "depth alone, which needs CUDA, nvdiffrast and the pretrained "
+             "weights. foundationpose-stub swaps the network for a geometric "
+             "solver to check the plumbing without a GPU -- its numbers are NOT "
+             "FoundationPose's",
+    )
+    p.add_argument(
+        "--box-extents", type=float, nargs=3, metavar=("D", "W", "H"),
+        help="foundationpose: true box size in metres, used to build the mesh. "
+             "Measure it if you can -- omitted, it is taken from the depth fit "
+             "on the first frame, and a wrong mesh biases every pose after it",
     )
 
     args = p.parse_args(argv)
 
     if args.probe:
-        return probe()
+        return probe(args.source)
 
     if args.selftest:
         from .selftest import run
 
-        return 0 if run() else 1
+        return 0 if run(camera=args.camera) else 1
 
-    source = build_source(args)
+    try:
+        source = build_source(args)
+    except ImportError as exc:
+        # A camera SDK that is not installed on this machine is an expected
+        # outcome, not a bug -- one line, not a traceback. Same treatment as a
+        # missing FoundationPose environment below.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
     # On synthetic input we know the answer, so print it. --distance places the
     # box *centre* at that range along the floor, while the pipeline reports the
@@ -168,28 +350,48 @@ def main(argv: list[str] | None = None) -> int:
         source.close()
         return 0
 
-    pipeline = BoxRangePipeline(
-        detector=PlaneClusterDetector(),
-        max_boxes=args.max_boxes,
-        min_confidence=args.min_confidence,
-    )
+    try:
+        engine = build_engine(args)
+    except ImportError as exc:
+        # A missing CUDA/FoundationPose environment is an expected outcome on a
+        # laptop, not a bug. Report it as one line instead of a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        source.close()
+        return 1
 
     saved = False
+    saved_rgb = False
     latencies: list[float] = []
     seen = 0
 
     try:
         for frame in source:
             t0 = time.perf_counter()
-            detections = pipeline.process(frame)
+            detections = engine.process(frame)
             latencies.append((time.perf_counter() - t0) * 1000.0)
             seen += 1
 
             for det in detections:
                 if args.json:
-                    print(json.dumps(detection_to_dict(det, frame)), flush=True)
+                    record = detection_to_dict(det, frame)
+                    # Name the engine in the record. Two engines writing the same
+                    # keys into the same log with no way to tell them apart is a
+                    # good way to publish a stub's numbers as FoundationPose's.
+                    record["engine"] = args.engine
+                    print(json.dumps(record), flush=True)
                 elif not args.quiet:
                     print(f"[{frame.index:4d}] track {det.track_id}  {det.range}")
+
+            if args.save_pseudo_rgb and not saved_rgb:
+                import cv2
+
+                from .foundationpose import depth_to_pseudo_rgb
+
+                cv2.imwrite(
+                    args.save_pseudo_rgb,
+                    depth_to_pseudo_rgb(frame.depth_m, frame.intrinsics),
+                )
+                saved_rgb = True
 
             if (args.show or args.save_overlay) and not (saved and not args.show):
                 from .viz import render_frame

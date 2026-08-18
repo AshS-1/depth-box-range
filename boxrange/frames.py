@@ -20,7 +20,7 @@ from typing import Protocol
 import numpy as np
 
 from .geometry import OrientedBox, Plane
-from .intrinsics import CameraIntrinsics
+from .intrinsics import CameraIntrinsics, d435_depth, gemini335_depth
 
 
 @dataclass(frozen=True)
@@ -190,6 +190,212 @@ class RealSenseSource:
                 self._pipeline.stop()
 
     def __enter__(self) -> RealSenseSource:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+# --------------------------------------------------------------------------
+# Live Orbbec (AgiBot X2 chest camera)
+# --------------------------------------------------------------------------
+
+
+class OrbbecSource:
+    """Live capture from an Orbbec Gemini 330-series camera.
+
+    This is the AgiBot X2's chest RGB-D sensor (Gemini 335: depth 1280x800 @
+    30 fps, 90 deg x 65 deg, 50 mm baseline, optimal range 0.26-3 m). It yields
+    the same :class:`Frame` as every other source, so nothing downstream changes.
+
+    Two differences from :class:`RealSenseSource` are worth knowing, because
+    both fail quietly rather than loudly:
+
+    **Depth scale is in millimetres.** ``depth_frame.get_depth_scale()`` returns
+    millimetres per depth unit; the identically named RealSense call returns
+    *metres* per unit. Treating one as the other is a factor of 1000, and since
+    every threshold in this package scales with the noise model, the symptom is
+    an empty detection list rather than an absurd distance. The conversion lives
+    in :meth:`CameraIntrinsics.from_orbbec` and nowhere else.
+
+    **Intrinsics come from the stream profile, not the camera param.**
+    ``Pipeline.get_camera_param()`` returns a matched depth/colour pair and needs
+    both sensors streaming, so it is unavailable in the depth-only mode this
+    package recommends. ``profile.get_intrinsic()`` works with depth alone.
+    """
+
+    def __init__(
+        self,
+        *,
+        width: int = 0,
+        height: int = 0,
+        fps: int = 0,
+        color: bool = False,
+        warmup_frames: int = 10,
+        timeout_ms: int = 5000,
+    ) -> None:
+        try:
+            import pyorbbecsdk as ob
+        except ImportError as exc:  # pragma: no cover - depends on platform
+            raise ImportError(
+                "pyorbbecsdk is required for OrbbecSource. Install with "
+                "`pip install pyorbbecsdk` (Linux x86_64/aarch64 and Windows "
+                "have wheels; macOS needs a source build). On the X2 itself the "
+                "SDK is already present. To work without the camera, record on "
+                "the robot with --record and replay the .npz anywhere."
+            ) from exc
+
+        self._ob = ob
+        self._closed = False
+        self._timeout_ms = int(timeout_ms)
+        self._pipeline = ob.Pipeline()
+        config = ob.Config()
+
+        depth_profile = self._pick_profile(ob.OBSensorType.DEPTH_SENSOR, width, height, fps)
+        config.enable_stream(depth_profile)
+
+        self._align = None
+        self._want_color = False
+        if color:
+            # Colour is off by default and should stay off for ranging. Aligning
+            # depth into the colour frame trims the FOV from 90x65 to the colour
+            # camera's 86x55 and resamples depth exactly at the discontinuities
+            # segmentation keys on. Nothing here measures with colour.
+            try:
+                color_profile = self._pick_profile(
+                    ob.OBSensorType.COLOR_SENSOR, width, height, fps, fmt=ob.OBFormat.RGB
+                )
+                config.enable_stream(color_profile)
+                self._align = ob.AlignFilter(align_to_stream=ob.OBStreamType.COLOR_STREAM)
+                self._want_color = True
+            except Exception:
+                # A unit with no colour sensor, or one already claimed by another
+                # process. Depth alone is the mode that matters, so carry on.
+                self._want_color = False
+
+        self._pipeline.start(config)
+        self.intrinsics = self._read_intrinsics(depth_profile)
+
+        for _ in range(warmup_frames):
+            # The first frames land before auto-exposure settles and are
+            # measurably noisier.
+            if self._pipeline.wait_for_frames(self._timeout_ms) is None:
+                break
+
+        self._index = 0
+
+    def _pick_profile(self, sensor_type, width: int, height: int, fps: int, fmt=None):
+        """Requested profile, or the device default if that exact mode is absent.
+
+        Zero means "any" to the SDK. Falling back rather than raising matters
+        because the same code runs against a Gemini 335 on the robot and
+        whatever development unit is on the bench, and those support different
+        mode tables.
+        """
+        ob = self._ob
+        profiles = self._pipeline.get_stream_profile_list(sensor_type)
+        if width or height or fps or fmt is not None:
+            default_fmt = ob.OBFormat.Y16 if sensor_type == ob.OBSensorType.DEPTH_SENSOR else None
+            try:
+                return profiles.get_video_stream_profile(
+                    width, height, fmt if fmt is not None else default_fmt, fps
+                )
+            except ob.OBError:
+                pass
+        return profiles.get_default_video_stream_profile()
+
+    def _read_intrinsics(self, depth_profile) -> CameraIntrinsics:
+        """Per-device calibration, with the depth scale folded in.
+
+        The scale is a property of a *frame*, not a profile, so one frame has to
+        be pulled before the intrinsics are complete. A camera that never
+        delivers one is a hard failure -- guessing 1 mm/unit here would produce
+        plausible-looking distances that are silently wrong on any device
+        configured for 0.1 mm units.
+        """
+        frames = None
+        for _ in range(10):
+            frames = self._pipeline.wait_for_frames(self._timeout_ms)
+            if frames is not None and frames.get_depth_frame() is not None:
+                break
+            frames = None
+        if frames is None:
+            self.close()
+            raise RuntimeError(
+                "Orbbec camera started but delivered no depth frame. Check the "
+                "USB 3 cable and, on Linux, that the udev rules from the SDK are "
+                "installed (99-obsensor-libusb.rules)."
+            )
+
+        depth_frame = frames.get_depth_frame()
+        intr = CameraIntrinsics.from_orbbec(
+            depth_profile.get_intrinsic(), depth_frame.get_depth_scale()
+        )
+        # Gemini 330-series baseline, for the z^2 noise model. The SDK exposes no
+        # baseline query, so it comes from the datasheet rather than the device.
+        return replace(intr, baseline_m=0.050, subpixel_px=gemini335_depth().subpixel_px)
+
+    @staticmethod
+    def _timestamp_s(frame) -> float:
+        """Frame timestamp in seconds, whatever the SDK version calls it.
+
+        pyorbbecsdk renamed this between v1 and v2 and the units differ by
+        accessor. Wrong-but-monotonic timestamps only affect logging here, so a
+        miss falls back to zero instead of raising.
+        """
+        for name, scale in (("get_timestamp_us", 1e-6), ("get_timestamp", 1e-3)):
+            getter = getattr(frame, name, None)
+            if getter is not None:
+                with contextlib.suppress(Exception):
+                    return float(getter()) * scale
+        return 0.0
+
+    def __iter__(self) -> Iterator[Frame]:
+        ob = self._ob
+        while not self._closed:
+            frames = self._pipeline.wait_for_frames(self._timeout_ms)
+            if frames is None:
+                continue
+            if self._align is not None:
+                frames = self._align.process(frames)
+                if frames is None:
+                    continue
+                frames = frames.as_frame_set()
+
+            depth_frame = frames.get_depth_frame()
+            if depth_frame is None:
+                continue
+
+            h, w = depth_frame.get_height(), depth_frame.get_width()
+            raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape(h, w)
+            depth_m = raw.astype(np.float32) * self.intrinsics.depth_scale
+
+            color = None
+            if self._want_color:
+                cf = frames.get_color_frame()
+                if cf is not None and cf.get_format() == ob.OBFormat.RGB:
+                    rgb = np.frombuffer(cf.get_data(), dtype=np.uint8).reshape(
+                        cf.get_height(), cf.get_width(), 3
+                    )
+                    color = rgb[..., ::-1].copy()  # the overlay draws in BGR
+
+            yield Frame(
+                depth_m=depth_m,
+                intrinsics=self.intrinsics,
+                color=color,
+                index=self._index,
+                timestamp_s=self._timestamp_s(depth_frame),
+            )
+            self._index += 1
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            # Teardown must not raise or a `with` block masks the real error.
+            with contextlib.suppress(Exception):
+                self._pipeline.stop()
+
+    def __enter__(self) -> OrbbecSource:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -415,10 +621,10 @@ class SyntheticSource:
         seed: int = 0,
     ) -> None:
         self.scene = scene or SyntheticScene()
-        # Defaults approximate a D435 depth stream at 640x480.
-        self.intrinsics = intrinsics or CameraIntrinsics(
-            width=640, height=480, fx=385.0, fy=385.0, cx=320.0, cy=240.0
-        )
+        # One definition of "a D435 depth stream", shared with the presets, so
+        # the selftest table and anything built on this default cannot drift
+        # apart by half a pixel and quietly report different accuracies.
+        self.intrinsics = intrinsics or d435_depth()
         self._frames = frames
         self._noise = noise
         self._rng = np.random.default_rng(seed)

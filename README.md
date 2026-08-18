@@ -1,9 +1,10 @@
 # boxrange
 
-Measure the distance to a box from RealSense depth camera input.
+Measure the distance to a box from depth camera input.
 
 Depth frame in, tracked metric distance out, ~30 FPS on a laptop CPU. No
-training, no CAD model, no GPU.
+training, no CAD model, no GPU. Runs on the AgiBot X2's chest Orbbec Gemini 335
+and on RealSense D400 cameras.
 
 ![overlay](docs/overlay.png)
 
@@ -49,6 +50,48 @@ python -m boxrange --frames 5 --distance 2.5 --json
 nearest *face*, so the two differ. The CLI prints the true face distance for
 comparison. Also try `--yaw`, `--box-size`, `--no-noise`.
 
+## Run it on the AgiBot X2
+
+The X2's RGB-D sensor is an **Orbbec Gemini 335** on the chest: depth up to
+1280x800 @ 30 fps, 90 deg x 65 deg, 50 mm baseline, 0.10-20 m range with an
+optimal band of 0.26-3 m, and a spatial precision spec of <=1.5% at 2 m. It is
+not a RealSense and it does not use the RealSense SDK.
+
+```bash
+pip install -e ".[orbbec]"
+python -m boxrange --probe                      # what is plugged in, and does it stream
+python -m boxrange --source orbbec --show       # depth only, which is the default here
+```
+
+`--probe` opens the stream rather than just enumerating, because enumeration
+succeeding only tells you the USB link is up -- not that the mode you asked for
+exists or that another process has not already claimed the device.
+
+**The depth scale is in millimetres.** Orbbec's `get_depth_scale()` returns
+millimetres per depth unit; the identically named RealSense call returns
+*metres*. Mixing them is a factor of 1000, and because every threshold in this
+package scales with the noise model, the symptom is an empty detection list
+rather than an obviously wrong distance. The conversion is confined to
+`CameraIntrinsics.from_orbbec` and is covered by a test.
+
+Depth-only is again the right mode. Aligning depth into the Gemini 335's colour
+frame trims the field of view from 90x65 to the colour camera's 86x55 and
+resamples depth exactly at the discontinuities segmentation keys on.
+
+You can model the camera without having one, which is the point of the preset:
+
+```bash
+python -m boxrange --camera gemini335 --selftest
+python -m boxrange --camera gemini335 --distance 2.0 --show
+```
+
+Two things the X2 documentation does not give you, and this package therefore
+does not invent. The **extrinsics** of the chest camera are unpublished, so
+every distance here is in the depth optical frame (+x right, +y down, +z
+forward); read the robot's own URDF or TF tree to put them in the base frame.
+And the **baseline** is not queryable over the SDK, so the noise model takes the
+datasheet's 50 mm rather than a per-device value.
+
 ## Run it with a RealSense
 
 ```bash
@@ -83,6 +126,88 @@ an optional learned detector.
 `pyrealsense2` has no wheel for macOS arm64, so it's an optional extra. The
 synthetic and `.npz` paths run anywhere.
 
+## FoundationPose from depth alone
+
+There is an alternative engine that gets the distance from [NVlabs
+FoundationPose](https://nvlabs.github.io/FoundationPose/) instead of from the
+geometric fit, driven by depth with no colour camera involved.
+
+**FoundationPose has no depth-only mode.** Both of its networks take a
+six-channel input built as `cat([rgb_crop, xyz_crop], dim=1)` — once for the
+rendered hypothesis and once for the observation — and `register(K, rgb, depth,
+ob_mask)` and `track_one(rgb, depth, K)` both take `rgb` positionally and warp
+it before anything else runs. Passing `None` is a crash, not a degraded mode.
+
+So depth-only here means *substituting* the colour channel, not omitting it, and
+the substitution is chosen rather than improvised. The rendered branch draws an
+untextured mesh with `use_light=True`, which in `Utils.nvdiffrast_render` is
+
+```
+I = clip(albedo * (0.8 + 0.5 * clip(-n_z, 0, 1)), 0, 1)
+```
+
+— a shading map and nothing else, no texture, background black. The closest
+achievable match for the observation branch is the same formula evaluated on
+normals estimated from depth, which is what `depth_to_pseudo_rgb` computes. Both
+branches then live in the same domain, which is the property render-and-compare
+depends on.
+
+![what FoundationPose is fed instead of colour](docs/pseudo_rgb.png)
+
+The other two inputs come from depth too. The **mask** normally comes from SAM
+or Mask R-CNN on the colour image; here it comes from the plane-and-cluster
+segmentation this package already has. The **CAD model** for a cuboid is its
+three side lengths, so nothing has to be authored — pass `--box-extents`, or let
+it be taken from the depth fit on the first frame.
+
+```bash
+# needs CUDA, nvdiffrast, and FoundationPose's weights on PYTHONPATH
+python -m boxrange --source orbbec --engine foundationpose --box-extents 0.4 0.3 0.25
+
+# check the plumbing without a GPU (this does NOT run FoundationPose)
+python -m boxrange --camera gemini335 --engine foundationpose-stub --json
+
+# eyeball what the network is actually being fed
+python -m boxrange --camera gemini335 --save-pseudo-rgb pseudo.png
+```
+
+### What it costs
+
+**Translation survives it; rotation and the score do not.** FoundationPose seeds
+translation from `guess_translation`, which is pure depth and mask, and refines
+it against the XYZ half of the input — the RGB half mostly disambiguates
+*rotation*. Distance is a translation question, and a cuboid's rotation is only
+recoverable up to its own symmetry anyway, so this particular task loses little.
+The pose *score* is a different matter: the scorer was trained on real imagery,
+a shading map is out of distribution for it, and it should be read as ordinal
+within a frame rather than as a calibrated confidence. The confidence on a
+`PoseResult` comes from geometric agreement between the returned pose and the
+observed points instead.
+
+**The shading map has a working range.** Normals from stereo depth are noisy —
+a raw central difference at 1.6 m is 52 deg of median error, i.e. pure noise, so
+the estimator smooths first. Even smoothed, measured against analytic normals
+with the Gemini 335 noise model:
+
+| range | 1.0 m | 1.6 m | 2.5 m | 3.5 m |
+|---|---|---|---|---|
+| median normal error | 3.1° | 5.9° | 10.9° | 19.8° |
+
+which is to say the substituted colour channel carries real signal roughly
+inside the Gemini 335's own optimal band of 0.26–3 m, and washes toward flat
+grey past it. Look at `--save-pseudo-rgb` output before trusting a result; if it
+is featureless, only the depth half of the network's input is real.
+
+**And for a box on a floor this is the expensive way to get the answer.** The
+geometric engine needs no GPU, no mesh and no network, and measures the same
+distance more accurately. Reach for this one when you want FoundationPose's
+actual strengths — full 6D pose of a specific known object, heavy occlusion,
+telling apart objects a plane fit cannot — and want them without a colour
+stream.
+
+Both engines emit the same JSON schema with an `engine` field, so their outputs
+are directly comparable and a stub run cannot be mistaken for a real one.
+
 ## Why it works
 
 **Depth measures range directly.** A box is a cuboid primitive and the sensor
@@ -108,26 +233,41 @@ carries ~16× the variance of one at 1 m.
 
 ## Accuracy and limits
 
-Against synthetic scenes with exact ground truth (0.40 × 0.30 × 0.25 m box,
-D435-like intrinsics): **−7 mm at 1 m, −27 mm at 2 m, −107 mm at 3.8 m**, with
-extents within ~2 cm out to 2.5 m. Run `--selftest` for the full table.
+Against synthetic scenes with exact ground truth (0.40 × 0.30 × 0.25 m box):
+
+| camera | 1 m | 1.9 m | 2.8 m | 3.8 m | modelled sigma at 3 m |
+|---|---|---|---|---|---|
+| D435, 640×480 | −7 mm | −26 mm | −58 mm | −95 mm | ±37 mm |
+| Gemini 335 (X2), 640×400 | −13 mm | −47 mm | −85 mm | −158 mm | ±68 mm |
+
+The X2's camera reads about 1.5× further near, because its modelled range noise
+is roughly 3× a D435's at the same distance and this bias is driven by that
+noise. **Do not carry the D435 numbers over to the robot.** Run
+`--selftest --camera gemini335` for the full table.
 
 Two limits worth knowing:
 
 - **The error is a bias, not noise.** It reads systematically *near* of truth,
   growing with range, because depth noise inflates the fitted footprint outward
   and pushes the near corner toward the camera. Reading near is the safe
-  direction for obstacle avoidance. Past ~3 m the bias **exceeds the reported
-  sigma**, so don't treat `interval_95` as covering truth at long range.
-- **These are synthetic-model numbers.** Real D400 depth also carries
-  fixed-pattern and thermal error this model omits. Validate against a real
-  camera and a tape measure before trusting them.
+  direction for obstacle avoidance. The bias exceeds the reported 1-sigma at
+  *every* range tested — about 1.4x at 1 m, rising to 1.9x (D435) and 2.5x
+  (Gemini 335) at 3.8 m. So `interval_95` still covers truth on a D435
+  throughout, but on the X2's camera it stops covering it past roughly 3 m.
+  Treat the number as a near-biased estimate rather than a centred one, and add
+  the bias back yourself if you need an unbiased range.
+- **These are synthetic-model numbers.** Real depth also carries fixed-pattern
+  and thermal error this model omits, and the Gemini 335 figure is derived from
+  a datasheet *bound* (<=1.5% at 2 m) rather than a measured typical, so it errs
+  wide. Validate against the real camera and a tape measure before trusting
+  them.
 
 Needs a visible support plane, and resolves a cuboid's pose only up to a
 cuboid's symmetry — it can't tell you which way the label faces. For full 6D
 pose of a specific object, heavy occlusion, or telling identical boxes apart,
-plug a learned detector into the `Detector` protocol in `boxrange/segment.py`;
-the network localises, depth still measures.
+either plug a learned detector into the `Detector` protocol in
+`boxrange/segment.py` — the network localises, depth still measures — or use the
+[FoundationPose engine](#foundationpose-from-depth-alone) above.
 
 ## Tests
 
@@ -136,9 +276,10 @@ pytest -q
 ruff check boxrange/ tests/
 ```
 
-48 tests. `test_accuracy.py` asserts metric results against known truth;
+79 tests. `test_accuracy.py` asserts metric results against known truth;
 `test_robustness.py` covers degenerate input, one case per bug found by
-fuzzing. RuntimeWarnings are errors.
+fuzzing. `test_foundationpose.py` covers the depth-only FoundationPose path with
+the network stubbed out. RuntimeWarnings are errors.
 
 Coordinate convention throughout is the depth optical frame: +x right, +y down,
 +z forward (OpenCV / RealSense).
