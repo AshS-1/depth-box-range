@@ -12,6 +12,7 @@ accuracy tests assert against.
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -527,6 +528,9 @@ class X2RgbdSource:
     guesswork about focal length -- only the stereo baseline, which CameraInfo
     does not carry.
 
+    Subscriptions only: this creates no publishers, services, parameters or
+    actions, so running it cannot perturb anything else using the robot.
+
     **QoS defaults to BEST_EFFORT**, and that is deliberate. A RELIABLE
     subscriber against a BEST_EFFORT publisher is an incompatible pair and
     receives *nothing*, with no error -- the single most common way a ROS 2
@@ -547,7 +551,7 @@ class X2RgbdSource:
         reliable: bool = False,
         queue_depth: int = 1,
         timeout_s: float = 5.0,
-        node_name: str = "boxrange_x2",
+        node_name: str | None = None,
     ) -> None:
         try:
             import rclpy
@@ -572,7 +576,12 @@ class X2RgbdSource:
         if self._owns_context:
             rclpy.init()
 
-        self._node = rclpy.create_node(node_name)
+        # Unique by default. The X2 is shared hardware, and two people running
+        # this at once -- or one person leaving a stale session behind -- puts two
+        # nodes with the same name on the graph, which ROS 2 warns about and
+        # which makes `ros2 node list` ambiguous for everyone else. The pid is
+        # enough to separate them and still says what the node is.
+        self._node = rclpy.create_node(node_name or f"boxrange_x2_{os.getpid()}")
         qos = QoSProfile(
             depth=queue_depth,
             reliability=(

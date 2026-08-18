@@ -255,3 +255,18 @@ def test_legacy_recordings_still_load(tmp_path):
         width=4, height=4, fx=385.0, fy=385.0, cx=1.5, cy=1.5,
     )
     assert NpzSource(path).intrinsics.subpixel_px == pytest.approx(0.08)
+
+
+def test_x2_node_names_are_unique_per_process():
+    """The X2 is shared hardware; colliding node names confuse everyone's graph.
+
+    Checked without ROS 2 by reading the default straight off the signature,
+    since constructing the source needs rclpy.
+    """
+    import inspect
+
+    from boxrange.frames import X2RgbdSource
+
+    assert inspect.signature(X2RgbdSource).parameters["node_name"].default is None
+    src = inspect.getsource(X2RgbdSource.__init__)
+    assert "os.getpid()" in src

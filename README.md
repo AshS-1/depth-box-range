@@ -60,25 +60,74 @@ with an optimal band of 0.26-3 m, and a spatial precision spec of <=1.5% at 2 m.
 **On the robot, reach it through the X2's own ROS 2 interface, not over USB.**
 The AIMDK stack owns the device, and a USB camera has exactly one owner.
 
+If you just want to see the pipeline work without a robot in front of you, the
+camera is modelled well enough to be useful on its own — jump to
+[Off the robot](#off-the-robot).
+
 ### Getting it running
 
-The X2 runs Ubuntu 22.04 with ROS 2 Humble. Run this either on the robot's
-onboard compute, or on a laptop on the same network — ROS 2 discovery makes both
-work, and the laptop is the nicer place to iterate.
+The X2 runs Ubuntu 22.04 with ROS 2 Humble, and the ROS 2 half of this only runs
+on a machine that has ROS 2 — which in practice means the robot itself, or a
+Linux machine on the same network. **On macOS or Windows, skip to
+[Iterating without tying up the robot](#iterating-without-tying-up-the-robot)
+and use the record-and-replay loop instead**; ROS 2 on those platforms is a
+rabbit hole for no gain here.
 
-**1. Copy the package over** (skip if you are on a dev machine already):
+Commands below are marked with where you type them:
+
+- `[laptop]` — your own machine, wherever you are now
+- `[robot]` — a shell on the robot, which you get with `ssh`
+
+**1. `[laptop]` Copy the package to the robot.** From the directory containing
+this README:
 
 ```bash
 scp -r boxrange pyproject.toml README.md <user>@<robot-host>:~/boxrange/
 ```
 
-**2. Create the venv so it can see `rclpy`.** This is the step that goes wrong.
-`rclpy` is not on PyPI — it ships with ROS 2 in the system Python, so a normal
-venv cannot import it and `--source x2` fails with "rclpy not found" even though
-ROS 2 is installed correctly:
+**2. `[laptop]` Log in to the robot.** Everything from here happens in this
+shell:
+
+```bash
+ssh <user>@<robot-host>
+```
+
+**3. `[robot]` Find out what state the robot is already in.** A robot someone
+has used before is usually set up already, so check before building anything:
 
 ```bash
 source /opt/ros/humble/setup.bash
+
+ros2 topic list | grep rgbd_head              # is the camera already publishing?
+ls ~/aimdk/install/setup.bash 2>/dev/null     # is the SDK already built?
+ls -d ~/aimdk 2>/dev/null                     # is the SDK even here?
+```
+
+That first line is the one that matters for this package. If the topics are
+listed, the sensor stack is up and you can read depth right now — the SDK
+question does not block you today.
+
+Then set up the AIMDK SDK per the X2 quick start. This package does not import
+anything from `aimdk` (the camera topics carry standard `sensor_msgs` types),
+but it is the documented environment for X2 development and you need it the
+moment you want to do anything beyond reading the camera:
+
+| what you found | what to do |
+|---|---|
+| `install/setup.bash` exists | `source ~/aimdk/install/setup.bash` — done |
+| `~/aimdk` exists, not built | `cd ~/aimdk && colcon build && source install/setup.bash` |
+| no `~/aimdk` | get the SDK archive from your team or the AgiBot portal, extract to `~/aimdk`, then build as above |
+
+`colcon build` on a full SDK takes a while. If the camera topics are already
+publishing, start it and move on to step 4 in a second `ssh` session rather than
+waiting.
+
+**4. `[robot]` Create the venv so it can see `rclpy`.** This is the step that
+goes wrong. `rclpy` is not on PyPI — it ships with ROS 2 in the system Python,
+so a normal venv cannot import it and `--source x2` fails with "rclpy not found"
+even though ROS 2 is installed correctly:
+
+```bash
 cd ~/boxrange
 python3 -m venv --system-site-packages .venv    # the flag is the point
 source .venv/bin/activate
@@ -93,7 +142,17 @@ sudo apt install python3-opencv python3-numpy
 pip install -e . --no-deps
 ```
 
-**3. Check the environment before blaming the code:**
+Every later `[robot]` command assumes all three `source` lines — ROS 2, the
+AIMDK workspace, and the venv — have been run in that shell. A fresh `ssh`
+session needs them again:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/aimdk/install/setup.bash
+source ~/boxrange/.venv/bin/activate
+```
+
+**5. `[robot]` Check the environment before blaming the code:**
 
 ```bash
 echo $ROS_DOMAIN_ID                  # must match the robot's; unset means 0
@@ -101,23 +160,8 @@ ros2 topic list | grep rgbd_head     # are the topics advertised at all
 ros2 topic hz /aima/hal/sensor/rgbd_head_front/depth_image
 ```
 
-If `ros2 topic list` shows nothing from a dev machine, it is almost always
-`ROS_DOMAIN_ID` or the two hosts not being on the same subnet.
-
-**4. Probe, then run:**
-
-```bash
-python -m boxrange --probe                 # lists topics, then actually subscribes
-python -m boxrange --source x2 --show      # live overlay
-python -m boxrange --source x2 --json      # one JSON record per detection
-```
-
-`--probe` is worth running first every time: it separates "no ROS 2", "topics
-not advertised", and "advertised but nothing arrives" (a QoS mismatch), which
-otherwise all look like a dead pipeline.
-
-**5. Confirm the depth encoding once.** The docs do not state it, and the code
-refuses to guess:
+**6. `[robot]` Confirm the depth encoding once.** The docs do not state it, and
+the code refuses to guess:
 
 ```bash
 ros2 topic echo --once --field encoding /aima/hal/sensor/rgbd_head_front/depth_image
@@ -126,22 +170,59 @@ ros2 topic echo --once --field encoding /aima/hal/sensor/rgbd_head_front/depth_i
 `16UC1` or `mono16` means millimetres, `32FC1` means metres. Both are handled;
 anything else raises with the topic name in the message.
 
-### Iterating without tying up the robot
-
-Record on the robot, analyse anywhere. This is the fastest loop, and it means
-tuning against a *fixed* scene instead of a live one:
+**7. `[robot]` Probe, then run:**
 
 ```bash
-# on the robot
-python -m boxrange --source x2 --record run.npz --frames 200
-
-# anywhere
-python -m boxrange --source npz --path run.npz --json > ranges.jsonl
-python -m boxrange --source npz --path run.npz --show
+python -m boxrange --probe                 # lists topics, then actually subscribes
+python -m boxrange --source x2 --json      # one JSON record per detection
 ```
 
-The `.npz` carries the intrinsics, so replayed results are identical to live
-ones.
+`--probe` is worth running first every time: it separates "no ROS 2", "topics
+not advertised", and "advertised but nothing arrives" (a QoS mismatch), which
+otherwise all look like a dead pipeline.
+
+Note `--show` opens a window, so over plain `ssh` it will fail with no display.
+Either use `ssh -X`, or record and view the overlay on your own machine — which
+is the next section, and the better habit anyway.
+
+Anything long-running (`--frames 0`, or a recording you walk away from) dies
+with the ssh session if the connection drops. Start it inside `tmux` and it
+survives:
+
+```bash
+tmux new -s boxrange        # detach with ctrl-b then d; reattach with `tmux a -t boxrange`
+```
+
+**Running from a Linux machine instead of the robot.** If you have one on the
+same network with ROS 2 Humble installed, steps 3-7 work there unchanged and no
+`scp` or `ssh` is needed — DDS discovery finds the robot's topics by itself. If
+`ros2 topic list` comes back empty, it is almost always `ROS_DOMAIN_ID` not
+matching the robot's, or the two hosts not being on the same subnet.
+
+### Iterating without tying up the robot
+
+Record on the robot, analyse anywhere. This is the fastest loop, and the only
+one that works if your own machine is macOS or Windows. It also means tuning
+against a *fixed* scene rather than a live one, so a change in the numbers is a
+change you made and not the robot drifting.
+
+```bash
+# [robot] capture ~7 seconds of the scene you care about
+python -m boxrange --source x2 --record run.npz --frames 200
+```
+
+```bash
+# [laptop] pull it back
+scp <user>@<robot-host>:~/boxrange/run.npz .
+
+# [laptop] and work on it, with no ROS 2 involved
+python -m boxrange --source npz --path run.npz --show
+python -m boxrange --source npz --path run.npz --json > ranges.jsonl
+```
+
+The `.npz` carries the intrinsics *and* the noise model, so replayed results are
+identical to live ones — no "works on my machine" gap between what you tune here
+and what the robot does.
 
 ### Using it as a library
 
