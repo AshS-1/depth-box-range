@@ -218,3 +218,40 @@ def test_from_orbbec_converts_millimetres_to_metres():
 
     assert CameraIntrinsics.from_orbbec(FakeIntrinsic(), 1.0).depth_scale == pytest.approx(1e-3)
     assert CameraIntrinsics.from_orbbec(FakeIntrinsic(), 0.1).depth_scale == pytest.approx(1e-4)
+
+
+# --------------------------------------------------------------------------
+# Record / replay
+# --------------------------------------------------------------------------
+
+
+def test_recording_round_trips_the_whole_noise_model(tmp_path):
+    """Replay must reproduce the capture sensor, not just its pixels.
+
+    ``subpixel_px`` is what makes range_sigma sensor-specific, and every
+    threshold in the pipeline scales with range_sigma. Dropping it replays a
+    Gemini 335 capture under a D435's disparity noise: same depth, quietly
+    different clustering tolerance, confidence and reported uncertainty.
+    """
+    from boxrange.frames import NpzSource, SyntheticScene, SyntheticSource, record_npz
+
+    intr = gemini335_depth(640, 400)
+    path = tmp_path / "run.npz"
+    record_npz(SyntheticSource(SyntheticScene(), intr, frames=2), path)
+
+    replayed = NpzSource(path).intrinsics
+    assert replayed == intr
+    assert replayed.range_sigma(3.0) == pytest.approx(intr.range_sigma(3.0))
+
+
+def test_legacy_recordings_still_load(tmp_path):
+    """A recording made before subpixel_px was saved was made on a D435."""
+    from boxrange.frames import NpzSource
+
+    path = tmp_path / "legacy.npz"
+    np.savez_compressed(
+        path,
+        depth_m=np.ones((1, 4, 4), dtype=np.float32),
+        width=4, height=4, fx=385.0, fy=385.0, cx=1.5, cy=1.5,
+    )
+    assert NpzSource(path).intrinsics.subpixel_px == pytest.approx(0.08)

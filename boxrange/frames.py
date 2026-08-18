@@ -725,6 +725,9 @@ class NpzSource:
             cy=float(data["cy"]),
             depth_scale=float(data["depth_scale"]) if "depth_scale" in data.files else 1e-3,
             baseline_m=float(data["baseline_m"]) if "baseline_m" in data.files else 0.050,
+            # Recordings made before this field was saved fall back to the D435
+            # value, which is what they were captured with.
+            subpixel_px=float(data["subpixel_px"]) if "subpixel_px" in data.files else 0.08,
         )
 
     def __iter__(self) -> Iterator[Frame]:
@@ -771,6 +774,11 @@ def record_npz(source: FrameSource, path: str | Path, max_frames: int = 150) -> 
         "width": intr.width, "height": intr.height,
         "fx": intr.fx, "fy": intr.fy, "cx": intr.cx, "cy": intr.cy,
         "depth_scale": intr.depth_scale, "baseline_m": intr.baseline_m,
+        # subpixel_px is part of the noise model, not decoration. Omitting it
+        # replays a Gemini 335 recording under a D435's disparity noise, which
+        # under-states sigma by ~1.5x and shifts every threshold that scales
+        # with range_sigma -- silently, since the depth itself is unchanged.
+        "subpixel_px": intr.subpixel_px,
     }
     if colors:
         payload["color"] = np.asarray(colors, dtype=np.uint8)
