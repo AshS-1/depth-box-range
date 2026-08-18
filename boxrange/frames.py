@@ -12,6 +12,7 @@ accuracy tests assert against.
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -197,16 +198,20 @@ class RealSenseSource:
 
 
 # --------------------------------------------------------------------------
-# Live Orbbec (AgiBot X2 chest camera)
+# Live Orbbec, straight over USB
 # --------------------------------------------------------------------------
 
 
 class OrbbecSource:
     """Live capture from an Orbbec Gemini 330-series camera.
 
-    This is the AgiBot X2's chest RGB-D sensor (Gemini 335: depth 1280x800 @
-    30 fps, 90 deg x 65 deg, 50 mm baseline, optimal range 0.26-3 m). It yields
+    The same part the AgiBot X2 carries in its head (Gemini 335: depth 1280x800
+    @ 30 fps, 90 deg x 65 deg, 50 mm baseline, optimal range 0.26-3 m). It yields
     the same :class:`Frame` as every other source, so nothing downstream changes.
+
+    **On the X2 itself, use :class:`X2RgbdSource` instead.** This class claims
+    the USB device, and on the robot that device already has an owner. This one
+    is for a Gemini 335 on a bench.
 
     Two differences from :class:`RealSenseSource` are worth knowing, because
     both fail quietly rather than loudly:
@@ -396,6 +401,298 @@ class OrbbecSource:
                 self._pipeline.stop()
 
     def __enter__(self) -> OrbbecSource:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+# --------------------------------------------------------------------------
+# AgiBot X2 head RGB-D, over the robot's own ROS 2 interface
+# --------------------------------------------------------------------------
+
+# From the X2 AIMDK sensor interface docs. Note "head_front": the RGB-D camera
+# is in the head, not the chest -- the chest carries the LiDAR and an IMU.
+X2_DEPTH_IMAGE = "/aima/hal/sensor/rgbd_head_front/depth_image"
+X2_DEPTH_INFO = "/aima/hal/sensor/rgbd_head_front/depth_camera_info"
+X2_RGB_IMAGE = "/aima/hal/sensor/rgbd_head_front/rgb_image"
+
+
+def decode_depth_image(
+    data: bytes, height: int, width: int, encoding: str, step: int, is_bigendian: bool = False
+) -> np.ndarray:
+    """A ``sensor_msgs/Image`` depth payload as metres, float32, 0 for no return.
+
+    The X2 docs give the topic and the message type but not the encoding, and
+    ROS publishes depth two different ways: ``16UC1`` in *millimetres* and
+    ``32FC1`` in *metres*. Guessing costs a factor of 1000 in one direction, so
+    this reads ``msg.encoding`` and refuses anything it does not recognise
+    rather than defaulting.
+
+    ``step`` is the row stride in bytes and is not always ``width * itemsize`` --
+    rows can be padded. Reshaping by width alone silently shears the image when
+    they are, which looks like a wildly tilted floor rather than like a bug.
+    """
+    if encoding in ("16UC1", "mono16"):
+        # Millimetres. NaN is not representable, so 0 is the no-return marker,
+        # which is also this package's convention.
+        dtype = np.dtype(">u2" if is_bigendian else "<u2")
+        scale = 1e-3
+    elif encoding == "32FC1":
+        # Metres already, but NaN and inf are, so fold them into the 0 marker.
+        dtype = np.dtype(">f4" if is_bigendian else "<f4")
+        scale = 1.0
+    else:
+        raise ValueError(
+            f"unsupported depth encoding {encoding!r}; expected 16UC1 (millimetres) "
+            "or 32FC1 (metres). Check the publisher with "
+            f"`ros2 topic echo --field encoding {X2_DEPTH_IMAGE}`."
+        )
+
+    per_row = step // dtype.itemsize
+    if per_row < width:
+        raise ValueError(f"step {step} is too small for width {width} at {encoding}")
+
+    raw = np.frombuffer(data, dtype=dtype, count=per_row * height)
+    depth = raw.reshape(height, per_row)[:, :width].astype(np.float32) * scale
+    with np.errstate(invalid="ignore"):
+        depth[~np.isfinite(depth) | (depth < 0)] = 0.0
+    return depth
+
+
+def depth_quantisation(encoding: str) -> float:
+    """Depth quantisation step in metres, for the uncertainty model.
+
+    ``16UC1`` resolves to a millimetre and that floor is real at close range.
+    ``32FC1`` carries far more precision than the sensor has, so it contributes
+    nothing and would only inflate the reported sigma.
+    """
+    return 1e-3 if encoding in ("16UC1", "mono16") else 0.0
+
+
+def intrinsics_from_camera_info(msg, **overrides) -> CameraIntrinsics:
+    """Build from a ``sensor_msgs/CameraInfo``.
+
+    This is the per-device factory calibration the robot publishes, so it beats
+    the datasheet preset in :func:`~boxrange.intrinsics.gemini335_depth` and
+    should always win where both are available.
+
+    ``CameraInfo`` carries no stereo baseline, so the noise model still takes
+    the Gemini 335's datasheet 50 mm.
+    """
+    # rclpy exposes the intrinsic matrix as `k`; ROS 1 and some bridges use `K`.
+    k = getattr(msg, "k", None)
+    if k is None:
+        k = getattr(msg, "K", None)
+    if k is None:
+        raise ValueError("CameraInfo has neither `k` nor `K`")
+
+    k = np.asarray(k, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite(k)) or k[0, 0] <= 0 or k[1, 1] <= 0:
+        raise ValueError(
+            f"CameraInfo carries no usable intrinsics (fx={k[0, 0]}, fy={k[1, 1]}). "
+            "The camera is publishing images before calibration is loaded."
+        )
+
+    preset = gemini335_depth()
+    return replace(
+        CameraIntrinsics(
+            width=int(msg.width),
+            height=int(msg.height),
+            fx=float(k[0, 0]),
+            fy=float(k[1, 1]),
+            cx=float(k[0, 2]),
+            cy=float(k[1, 2]),
+            baseline_m=preset.baseline_m,
+            subpixel_px=preset.subpixel_px,
+        ),
+        **overrides,
+    )
+
+
+class X2RgbdSource:
+    """The AgiBot X2's head RGB-D camera, over the robot's ROS 2 interface.
+
+    This is the supported way to get depth on the robot. :class:`OrbbecSource`
+    opens the Gemini 335 directly over USB, which works on a bench but on the
+    X2 means competing with the robot's own stack for the device -- a USB camera
+    has one owner, and the loser gets "device busy" or nothing at all.
+
+    Topics, from the AIMDK sensor interface docs, at 30 Hz::
+
+        /aima/hal/sensor/rgbd_head_front/depth_image        sensor_msgs/Image
+        /aima/hal/sensor/rgbd_head_front/depth_camera_info  sensor_msgs/CameraInfo
+
+    Intrinsics come from ``depth_camera_info``, so this needs no datasheet
+    guesswork about focal length -- only the stereo baseline, which CameraInfo
+    does not carry.
+
+    **QoS defaults to BEST_EFFORT**, and that is deliberate. A RELIABLE
+    subscriber against a BEST_EFFORT publisher is an incompatible pair and
+    receives *nothing*, with no error -- the single most common way a ROS 2
+    camera subscription appears dead. BEST_EFFORT is compatible with publishers
+    of either kind, and for a camera dropping a stale frame is what you want
+    anyway. The docs say these topics publish RELIABLE, so pass
+    ``reliable=True`` if you would rather have the matching pair and the
+    delivery guarantee.
+    """
+
+    def __init__(
+        self,
+        *,
+        depth_topic: str = X2_DEPTH_IMAGE,
+        info_topic: str = X2_DEPTH_INFO,
+        color_topic: str = X2_RGB_IMAGE,
+        color: bool = False,
+        reliable: bool = False,
+        queue_depth: int = 1,
+        timeout_s: float = 5.0,
+        node_name: str = "boxrange_x2",
+    ) -> None:
+        try:
+            import rclpy
+            from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+            from sensor_msgs.msg import CameraInfo, Image
+        except ImportError as exc:  # pragma: no cover - needs a ROS 2 install
+            raise ImportError(
+                "rclpy and sensor_msgs are required for X2RgbdSource. They come "
+                "from a ROS 2 installation, not from pip -- source the robot's "
+                "setup.bash (or your own ROS 2 Humble install) and run again. "
+                "To work off-robot, record on the X2 with --record and replay "
+                "the .npz anywhere."
+            ) from exc
+
+        self._rclpy = rclpy
+        self._closed = False
+        self._timeout_s = float(timeout_s)
+
+        # Do not tear down a context this process did not create: boxrange may be
+        # one node inside a larger application that called rclpy.init itself.
+        self._owns_context = not rclpy.ok()
+        if self._owns_context:
+            rclpy.init()
+
+        self._node = rclpy.create_node(node_name)
+        qos = QoSProfile(
+            depth=queue_depth,
+            reliability=(
+                QoSReliabilityPolicy.RELIABLE if reliable else QoSReliabilityPolicy.BEST_EFFORT
+            ),
+        )
+
+        self._depth_msg = None
+        self._color_msg = None
+        self._info = None
+
+        self._node.create_subscription(Image, depth_topic, self._on_depth, qos)
+        self._node.create_subscription(CameraInfo, info_topic, self._on_info, qos)
+        self._want_color = color
+        if color:
+            self._node.create_subscription(Image, color_topic, self._on_color, qos)
+
+        self._depth_topic = depth_topic
+        self._info_topic = info_topic
+        self.intrinsics = self._await_intrinsics()
+        self._index = 0
+
+    # -- callbacks: keep only the newest, since ranging wants the latest state --
+
+    def _on_depth(self, msg) -> None:
+        self._depth_msg = msg
+
+    def _on_color(self, msg) -> None:
+        self._color_msg = msg
+
+    def _on_info(self, msg) -> None:
+        self._info = msg
+
+    def _spin_until(self, predicate) -> bool:
+        """Pump callbacks until ``predicate`` holds or the timeout expires.
+
+        Spinning here rather than on a background thread keeps this a pull-based
+        iterator like every other source, so the pipeline never learns it is
+        talking to ROS and there is no shared state to lock.
+        """
+        deadline = time.monotonic() + self._timeout_s
+        while not predicate():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            self._rclpy.spin_once(self._node, timeout_sec=min(remaining, 0.1))
+        return True
+
+    def _await_intrinsics(self) -> CameraIntrinsics:
+        """Block until CameraInfo arrives; without it there is no metric answer.
+
+        Failing here with the topic name beats streaming frames that cannot be
+        deprojected, and separates "nothing is publishing" from "the calibration
+        has not been loaded yet", which look identical from a dead pipeline.
+        """
+        if not self._spin_until(lambda: self._info is not None and self._depth_msg is not None):
+            missing = []
+            if self._info is None:
+                missing.append(self._info_topic)
+            if self._depth_msg is None:
+                missing.append(self._depth_topic)
+            self.close()
+            raise RuntimeError(
+                f"no messages on {' and '.join(missing)} within {self._timeout_s:.0f}s. "
+                "Check `ros2 topic list` and `ros2 topic hz`, that the robot's "
+                "sensor stack is up, and that ROS_DOMAIN_ID matches. If the topic "
+                "is publishing but nothing arrives here, it is a QoS mismatch -- "
+                "see this class's docstring."
+            )
+
+        return replace(
+            intrinsics_from_camera_info(self._info),
+            depth_scale=depth_quantisation(self._depth_msg.encoding),
+        )
+
+    def _decode(self, msg) -> np.ndarray:
+        return decode_depth_image(
+            msg.data, msg.height, msg.width, msg.encoding, msg.step, msg.is_bigendian
+        )
+
+    def __iter__(self) -> Iterator[Frame]:
+        while not self._closed:
+            previous = self._depth_msg
+            # Bind `previous` as a default rather than closing over it: the
+            # lambda is consumed immediately so late binding is harmless today,
+            # but the pattern is one edit away from being a real bug.
+            if not self._spin_until(lambda prev=previous: self._depth_msg is not prev):
+                return  # The stream stopped; ending the iteration says so.
+
+            msg = self._depth_msg
+            color = None
+            if self._want_color and self._color_msg is not None:
+                cm = self._color_msg
+                if cm.encoding in ("rgb8", "bgr8"):
+                    img = np.frombuffer(cm.data, dtype=np.uint8).reshape(
+                        cm.height, cm.step // 3, 3
+                    )[:, : cm.width]
+                    color = img[..., ::-1].copy() if cm.encoding == "rgb8" else img.copy()
+
+            stamp = msg.header.stamp
+            yield Frame(
+                depth_m=self._decode(msg),
+                intrinsics=self.intrinsics,
+                color=color,
+                index=self._index,
+                timestamp_s=float(stamp.sec) + float(stamp.nanosec) * 1e-9,
+            )
+            self._index += 1
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            self._node.destroy_node()
+        if self._owns_context:
+            with contextlib.suppress(Exception):
+                self._rclpy.shutdown()
+
+    def __enter__(self) -> X2RgbdSource:
         return self
 
     def __exit__(self, *exc) -> None:

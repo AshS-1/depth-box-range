@@ -10,11 +10,13 @@ import time
 import numpy as np
 
 from .frames import (
+    X2_DEPTH_IMAGE,
     NpzSource,
     OrbbecSource,
     RealSenseSource,
     SyntheticScene,
     SyntheticSource,
+    X2RgbdSource,
     record_npz,
 )
 from .intrinsics import CAMERA_PRESETS, PRESET_RESOLUTIONS
@@ -23,6 +25,10 @@ from .segment import PlaneClusterDetector
 
 
 def build_source(args):
+    if args.source == "x2":
+        # No width/height: the robot publishes one depth stream and its
+        # CameraInfo is authoritative, so there is nothing to negotiate.
+        return X2RgbdSource(color=not args.no_color, reliable=args.ros_reliable)
     if args.source == "orbbec":
         # 0 means "whatever the device offers by default" to the Orbbec SDK.
         return OrbbecSource(
@@ -130,10 +136,12 @@ def build_engine(args):
 def probe_orbbec() -> int:
     """Report connected Orbbec devices, then actually open the depth stream.
 
-    The X2's chest camera is a Gemini 335, so this is the probe that matters on
-    the robot. Opening the stream is the only real test: enumeration succeeding
-    tells you the USB link is up, not that the mode you asked for exists or that
-    another process has not already claimed the device.
+    For a Gemini 335 plugged in over USB. On the X2 itself the head camera is
+    reached over ROS 2 instead -- see :func:`probe_x2`.
+
+    Opening the stream is the only real test: enumeration succeeding tells you
+    the USB link is up, not that the mode you asked for exists or that another
+    process has not already claimed the device.
     """
     try:
         import pyorbbecsdk as ob
@@ -164,6 +172,55 @@ def probe_orbbec() -> int:
     intr = source.intrinsics
     source.close()
     return _report_stream(intr, "python -m boxrange --source orbbec --no-color --show")
+
+
+def probe_x2() -> int:
+    """Report whether the X2's head RGB-D topics are actually publishing.
+
+    Distinguishes the failures that all look like a dead pipeline: no ROS 2 at
+    all, ROS 2 up but the sensor stack down, the topic advertised but silent, and
+    the topic publishing to a subscriber that cannot receive it because the QoS
+    is incompatible.
+    """
+    try:
+        import rclpy
+    except ImportError:
+        print("rclpy not found. Source the robot's ROS 2 setup.bash "
+              "(ROS 2 does not install from pip).", file=sys.stderr)
+        return 1
+
+    owns = not rclpy.ok()
+    if owns:
+        rclpy.init()
+    node = rclpy.create_node("boxrange_probe")
+    try:
+        topics = dict(node.get_topic_names_and_types())
+        found = [t for t in topics if "rgbd_head_front" in t]
+        if not found:
+            print("no /aima/hal/sensor/rgbd_head_front/* topics advertised. Is the "
+                  "robot's sensor stack running, and does ROS_DOMAIN_ID match?",
+                  file=sys.stderr)
+            return 1
+        for topic in sorted(found):
+            print(f"{topic}  {','.join(topics[topic])}")
+        if X2_DEPTH_IMAGE not in topics:
+            print(f"\nwarning: {X2_DEPTH_IMAGE} is not among them; depth is what "
+                  "this package needs.", file=sys.stderr)
+    finally:
+        node.destroy_node()
+        if owns:
+            rclpy.shutdown()
+
+    # Advertised is not the same as receivable, so actually subscribe.
+    try:
+        source = X2RgbdSource(color=False, timeout_s=10.0)
+    except Exception as exc:
+        print(f"topics advertised but no frames received: {exc}", file=sys.stderr)
+        return 1
+
+    intr = source.intrinsics
+    source.close()
+    return _report_stream(intr, "python -m boxrange --source x2 --show")
 
 
 def probe_realsense() -> int:
@@ -216,6 +273,8 @@ def probe(source: str) -> int:
     so try both and report each. Returning 0 if *either* works keeps the exit
     code meaning "a usable depth camera is attached".
     """
+    if source == "x2":
+        return probe_x2()
     if source == "orbbec":
         return probe_orbbec()
     if source in ("live", "bag"):
@@ -223,11 +282,13 @@ def probe(source: str) -> int:
 
     # Flush: these headers go to stdout while the failure messages below go
     # to stderr, and without flushing the two arrive out of order.
-    print("== Orbbec (AgiBot X2 chest camera) ==", flush=True)
+    print("== AgiBot X2 head RGB-D (ROS 2) ==", flush=True)
+    x2 = probe_x2()
+    print("\n== Orbbec (Gemini 335 over USB) ==", flush=True)
     orbbec = probe_orbbec()
     print("\n== RealSense ==", flush=True)
     realsense = probe_realsense()
-    return 0 if (orbbec == 0 or realsense == 0) else 1
+    return 0 if 0 in (x2, orbbec, realsense) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -237,15 +298,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--source", default="synthetic",
-        choices=("orbbec", "live", "bag", "npz", "synthetic"),
+        choices=("x2", "orbbec", "live", "bag", "npz", "synthetic"),
         help="where frames come from (default: synthetic, needs no hardware). "
-             "orbbec = Orbbec Gemini 330-series, the AgiBot X2's chest camera; "
+             "x2 = the AgiBot X2's head RGB-D camera over its ROS 2 "
+             "interface; orbbec = a Gemini 335 straight over USB; "
              "live/bag = RealSense",
     )
     p.add_argument(
         "--camera", default="d435", choices=tuple(CAMERA_PRESETS),
         help="synthetic/selftest: which sensor to model. gemini335 is the X2's "
-             "chest camera and carries ~3x a D435's range noise, so its accuracy "
+             "head camera and carries ~3x a D435's range noise, so its accuracy "
              "table is a different table (default: d435)",
     )
     p.add_argument("--path", help="file for --source bag / npz")
@@ -255,6 +317,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--width", type=int, help="depth width (default: per --camera / device)")
     p.add_argument("--height", type=int, help="depth height (default: per --camera / device)")
     p.add_argument("--fps", type=int, default=30)
+    p.add_argument(
+        "--ros-reliable", action="store_true",
+        help="x2: subscribe RELIABLE instead of BEST_EFFORT. The default is "
+             "BEST_EFFORT because it is compatible with publishers of either "
+             "kind, while a RELIABLE subscriber against a BEST_EFFORT publisher "
+             "silently receives nothing",
+    )
     p.add_argument(
         "--no-color", action="store_true",
         help="live/bag: depth only. Recommended for ranging -- aligning depth to "

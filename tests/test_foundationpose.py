@@ -378,45 +378,10 @@ def test_missing_foundationpose_raises_an_actionable_error():
 
 # --------------------------------------------------------------------------
 # Camera setup
+#
+# The intrinsics presets and the X2's ROS 2 depth interface live in
+# test_cameras.py. Only the interaction with this engine belongs here.
 # --------------------------------------------------------------------------
-
-
-def test_gemini335_preset_reproduces_the_datasheet():
-    intr = gemini335_depth()
-    assert (intr.width, intr.height) == (1280, 800)
-    # 90 deg horizontal FOV.
-    assert np.rad2deg(2 * np.arctan(intr.width / 2 / intr.fx)) == pytest.approx(90.0)
-    # Vertical follows from square pixels and lands inside the quoted 65 +/- 3.
-    vfov = np.rad2deg(2 * np.arctan(intr.height / 2 / intr.fy))
-    assert 62.0 <= vfov <= 68.0
-    # Spatial precision <= 1.5% at 2 m.
-    assert intr.range_sigma(2.0) == pytest.approx(0.015 * 2.0, rel=1e-6)
-
-
-def test_from_fov_round_trips_and_validates():
-    intr = CameraIntrinsics.from_fov(848, 480, hfov_deg=87.0, vfov_deg=58.0)
-    assert np.rad2deg(2 * np.arctan(848 / 2 / intr.fx)) == pytest.approx(87.0)
-    assert np.rad2deg(2 * np.arctan(480 / 2 / intr.fy)) == pytest.approx(58.0)
-    with pytest.raises(ValueError):
-        CameraIntrinsics.from_fov(640, 480, hfov_deg=200.0)
-    with pytest.raises(ValueError):
-        CameraIntrinsics.from_fov(640, 480, hfov_deg=90.0, vfov_deg=0.0)
-
-
-def test_from_orbbec_converts_millimetres_to_metres():
-    """Orbbec's get_depth_scale() is mm/unit; RealSense's is m/unit.
-
-    Mixing them is a factor of 1000 that shows up as an empty detection list
-    rather than an obviously wrong distance, so it is worth a test of its own.
-    """
-
-    class FakeIntrinsic:
-        width, height = 1280, 800
-        fx = fy = 640.0
-        cx, cy = 639.5, 399.5
-
-    assert CameraIntrinsics.from_orbbec(FakeIntrinsic(), 1.0).depth_scale == pytest.approx(1e-3)
-    assert CameraIntrinsics.from_orbbec(FakeIntrinsic(), 0.1).depth_scale == pytest.approx(1e-4)
 
 
 def test_the_pipeline_runs_at_the_x2_cameras_intrinsics():

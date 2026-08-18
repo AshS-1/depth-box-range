@@ -10,9 +10,10 @@ Quick start::
             for det in pipeline.process(frame):
                 print(det.range)
 
-Swap ``SyntheticSource`` for ``OrbbecSource()`` (the AgiBot X2's chest Gemini
-335) or ``RealSenseSource()`` to run against hardware; the pipeline itself does
-not change.
+Swap ``SyntheticSource`` for ``X2RgbdSource()`` (the AgiBot X2's head RGB-D
+camera, over the robot's ROS 2 interface), ``OrbbecSource()`` (a Gemini 335
+straight over USB) or ``RealSenseSource()`` to run against hardware; the
+pipeline itself does not change.
 
 :mod:`boxrange.foundationpose` is an alternative engine that drives NVlabs
 FoundationPose from depth alone. It needs CUDA and buys you full 6D pose of a
@@ -29,6 +30,8 @@ from .foundationpose import (
     surface_normals,
 )
 from .frames import (
+    X2_DEPTH_IMAGE,
+    X2_DEPTH_INFO,
     Frame,
     FrameSource,
     NpzSource,
@@ -36,6 +39,9 @@ from .frames import (
     RealSenseSource,
     SyntheticScene,
     SyntheticSource,
+    X2RgbdSource,
+    decode_depth_image,
+    intrinsics_from_camera_info,
     record_npz,
     render_depth,
 )
@@ -63,6 +69,8 @@ __version__ = "0.1.0"
 __all__ = [
     "CAMERA_PRESETS",
     "PRESET_RESOLUTIONS",
+    "X2_DEPTH_IMAGE",
+    "X2_DEPTH_INFO",
     "BoxDetection",
     "BoxRangePipeline",
     "CameraIntrinsics",
@@ -82,10 +90,12 @@ __all__ = [
     "RegionPriorDetector",
     "SyntheticScene",
     "SyntheticSource",
+    "X2RgbdSource",
     "__version__",
     "closest_point_on_box",
     "count_visible_faces",
     "d435_depth",
+    "decode_depth_image",
     "deproject",
     "depth_to_pseudo_rgb",
     "detection_to_dict",
@@ -93,6 +103,7 @@ __all__ = [
     "fit_box_on_plane",
     "fit_plane_ransac",
     "gemini335_depth",
+    "intrinsics_from_camera_info",
     "record_npz",
     "render_depth",
     "surface_normals",

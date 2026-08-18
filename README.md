@@ -3,8 +3,8 @@
 Measure the distance to a box from depth camera input.
 
 Depth frame in, tracked metric distance out, ~30 FPS on a laptop CPU. No
-training, no CAD model, no GPU. Runs on the AgiBot X2's chest Orbbec Gemini 335
-and on RealSense D400 cameras.
+training, no CAD model, no GPU. Runs on the AgiBot X2's head RGB-D camera and on
+RealSense D400 cameras.
 
 ![overlay](docs/overlay.png)
 
@@ -52,45 +52,78 @@ comparison. Also try `--yaw`, `--box-size`, `--no-noise`.
 
 ## Run it on the AgiBot X2
 
-The X2's RGB-D sensor is an **Orbbec Gemini 335** on the chest: depth up to
-1280x800 @ 30 fps, 90 deg x 65 deg, 50 mm baseline, 0.10-20 m range with an
-optimal band of 0.26-3 m, and a spatial precision spec of <=1.5% at 2 m. It is
-not a RealSense and it does not use the RealSense SDK.
+The X2's depth sensor is an **Orbbec Gemini 335 in the head**, front-facing:
+depth up to 1280x800 @ 30 fps, 90 deg x 65 deg, 50 mm baseline, 0.10-20 m range
+with an optimal band of 0.26-3 m, and a spatial precision spec of <=1.5% at 2 m.
+(The chest carries the LiDAR and an IMU, not the depth camera.)
+
+**On the robot, reach it through the X2's own ROS 2 interface, not over USB.**
+The AIMDK stack owns the device, and a USB camera has exactly one owner.
+
+```bash
+source /opt/ros/humble/setup.bash          # or the robot's own setup.bash
+python -m boxrange --probe                 # which topics exist, and do they deliver
+python -m boxrange --source x2 --show
+```
+
+Topics used, from the AIMDK sensor interface docs, at 30 Hz:
+
+| topic | type | used for |
+|---|---|---|
+| `/aima/hal/sensor/rgbd_head_front/depth_image` | `sensor_msgs/Image` | the measurement |
+| `/aima/hal/sensor/rgbd_head_front/depth_camera_info` | `sensor_msgs/CameraInfo` | intrinsics |
+| `/aima/hal/sensor/rgbd_head_front/rgb_image` | `sensor_msgs/Image` | overlay only, off by default |
+
+Intrinsics come from `depth_camera_info`, so nothing is guessed from a
+datasheet except the stereo baseline, which `CameraInfo` does not carry.
+
+Three things that bite here, all of which fail silently:
+
+- **Depth units are not in the docs.** ROS publishes depth as `16UC1` in
+  *millimetres* or `32FC1` in *metres*. `decode_depth_image` reads
+  `msg.encoding` and refuses anything else rather than defaulting — guessing is
+  a factor of 1000, and because every threshold scales with the noise model the
+  symptom is an empty detection list, not an absurd number.
+- **QoS.** The subscription is BEST_EFFORT by default. A RELIABLE subscriber
+  against a BEST_EFFORT publisher is an incompatible pair and receives
+  *nothing*, with no error — the most common way a ROS 2 camera looks dead. The
+  docs say these topics publish RELIABLE, so `--ros-reliable` gets you the
+  matching pair if you want the delivery guarantee.
+- **Row stride.** `msg.step` is a byte stride and need not equal
+  `width * itemsize`. Reshaping by width alone shears the image, which the plane
+  fit happily interprets as a tilted floor and reports with high confidence.
+
+`--probe` lists the advertised topics *and* then actually subscribes, because
+advertised is not the same as receivable — that is exactly the QoS trap above.
+
+### Off the robot
+
+A Gemini 335 on a bench, over USB:
 
 ```bash
 pip install -e ".[orbbec]"
-python -m boxrange --probe                      # what is plugged in, and does it stream
-python -m boxrange --source orbbec --show       # depth only, which is the default here
+python -m boxrange --source orbbec --show
 ```
 
-`--probe` opens the stream rather than just enumerating, because enumeration
-succeeding only tells you the USB link is up -- not that the mode you asked for
-exists or that another process has not already claimed the device.
+Note Orbbec's `get_depth_scale()` returns **millimetres** per unit while the
+identically named RealSense call returns *metres*; the conversion is confined to
+`CameraIntrinsics.from_orbbec` and has its own test.
 
-**The depth scale is in millimetres.** Orbbec's `get_depth_scale()` returns
-millimetres per depth unit; the identically named RealSense call returns
-*metres*. Mixing them is a factor of 1000, and because every threshold in this
-package scales with the noise model, the symptom is an empty detection list
-rather than an obviously wrong distance. The conversion is confined to
-`CameraIntrinsics.from_orbbec` and is covered by a test.
-
-Depth-only is again the right mode. Aligning depth into the Gemini 335's colour
-frame trims the field of view from 90x65 to the colour camera's 86x55 and
-resamples depth exactly at the discontinuities segmentation keys on.
-
-You can model the camera without having one, which is the point of the preset:
+Or with no camera at all — the preset models the sensor so results transfer:
 
 ```bash
 python -m boxrange --camera gemini335 --selftest
 python -m boxrange --camera gemini335 --distance 2.0 --show
 ```
 
-Two things the X2 documentation does not give you, and this package therefore
-does not invent. The **extrinsics** of the chest camera are unpublished, so
-every distance here is in the depth optical frame (+x right, +y down, +z
-forward); read the robot's own URDF or TF tree to put them in the base frame.
-And the **baseline** is not queryable over the SDK, so the noise model takes the
-datasheet's 50 mm rather than a per-device value.
+Depth-only is the right mode throughout. Aligning depth into the Gemini's colour
+frame trims the field of view from 90x65 to the colour camera's 86x55 and
+resamples depth exactly at the discontinuities segmentation keys on.
+
+**Extrinsics are not published**, so every distance here is in the depth optical
+frame (+x right, +y down, +z forward). Ranging does not need them — the ground
+plane is fitted from depth — but putting a distance into the robot's base frame
+does; read it from the robot's TF tree rather than hardcoding.
 
 ## Run it with a RealSense
 
@@ -238,7 +271,7 @@ Against synthetic scenes with exact ground truth (0.40 × 0.30 × 0.25 m box):
 | camera | 1 m | 1.9 m | 2.8 m | 3.8 m | modelled sigma at 3 m |
 |---|---|---|---|---|---|
 | D435, 640×480 | −7 mm | −26 mm | −58 mm | −95 mm | ±37 mm |
-| Gemini 335 (X2), 640×400 | −13 mm | −47 mm | −85 mm | −158 mm | ±68 mm |
+| Gemini 335 (X2 head), 640×400 | −13 mm | −47 mm | −85 mm | −158 mm | ±68 mm |
 
 The X2's camera reads about 1.5× further near, because its modelled range noise
 is roughly 3× a D435's at the same distance and this bias is driven by that
@@ -276,10 +309,11 @@ pytest -q
 ruff check boxrange/ tests/
 ```
 
-79 tests. `test_accuracy.py` asserts metric results against known truth;
+94 tests. `test_accuracy.py` asserts metric results against known truth;
 `test_robustness.py` covers degenerate input, one case per bug found by
 fuzzing. `test_foundationpose.py` covers the depth-only FoundationPose path with
-the network stubbed out. RuntimeWarnings are errors.
+the network stubbed out, and `test_cameras.py` covers the intrinsics presets and
+the X2's ROS 2 depth decoding without needing ROS 2 installed. RuntimeWarnings are errors.
 
 Coordinate convention throughout is the depth optical frame: +x right, +y down,
 +z forward (OpenCV / RealSense).

@@ -52,7 +52,7 @@ class CameraIntrinsics:
         """Nominal intrinsics from a datasheet field of view.
 
         For a stand-in when the camera is not plugged in -- simulating the X2's
-        chest camera on a laptop, say. Always prefer the factory calibration
+        head camera on a laptop, say. Always prefer the factory calibration
         that :meth:`from_orbbec` reads off the device.
 
         The image spans ``width`` pixels of *area*, so its half-extent is
@@ -163,7 +163,7 @@ def subpixel_from_spec(
 
 def gemini335_depth(width: int = 1280, height: int = 800, **overrides) -> CameraIntrinsics:
     """Nominal depth intrinsics for the Orbbec Gemini 335 -- the AgiBot X2's
-    chest RGB-D camera.
+    head RGB-D camera.
 
     Datasheet: depth FOV 90 deg x 65 deg, up to 1280x800 @ 30 fps, 50 mm
     baseline, range 0.10-20 m with an optimal band of 0.26-3 m, spatial
